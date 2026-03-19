@@ -1,0 +1,3072 @@
+
+
+
+const scriptProps = PropertiesService.getScriptProperties();
+const lockService = LockService.getScriptLock();
+const userLockService = LockService.getUserLock(); // 🔥 ДОБАВИТЬ ДЛЯ АНТИ-ДАБЛКЛИКА
+
+// 🔥 Глобальный объект для индексов колонок
+let COL_IDX = {};
+
+// ===================== НАСТРОЙКИ И КОНСТАНТЫ =====================
+const CONFIG = {
+  TOKEN: '8230908280:AAEaky2wog0lVM62qtcsaFcFXU-yipweAZA',
+  CHAT_ID: '-1003283469910',   //тест - -1003570835806, релиз - -1003283469910
+  DEBUG: false,
+  
+  SPREADSHEET_ID: '1ixHPQRRYuLbeU1nCpFsRAILHZUn8rfqx4_LVQ-GL-hA',
+  OCR_FOLDER_ID: '1DXEKv6kDtnPdOQWKW0nLCrWoyaCCFNf_',
+  YANDEX_API_KEY: '9ab1b5aa-af77-408e-b46d-586a7d794ee4',
+
+  SHEETS: {
+    ORDERS: 'Заказы',
+    REPORTS: 'Отчёты',
+    SUPPLIERS: 'Поставщики',
+    ADDITIONAL: 'Дополнительный',
+    OCR_SUMS: 'OCR_Суммы',
+    TB: 'ТБ',
+    EXTRA: 'Доп Дела'
+  },
+
+  // 🔥 ОБНОВЛЕННЫЕ НАЗВАНИЯ СТОЛБЦОВ (согласно вашему списку)
+  COLUMN_NAMES: {
+    DATE: 'Дата поставки',              // Используем дату доставки для фильтрации "на сегодня"
+    ORDER_NUM: 'Номер заказа',
+    COMMENT: 'Примечания к заказу',
+    DELIVERY: 'Способ доставки',
+    SOURCE: 'Откуда заказ',
+    MODEL: 'Наименование модели',
+    SUPPLIER: 'Поставщик',
+    CLIENT: 'ФИО',
+    PHONE: 'Телефон',
+    ADDRESS: 'Адрес',
+    PAYMENT: 'Карта',                   // Поле типа оплаты
+    SUP_PRICE_BYN: 'Цена поставщика BYN',
+    SUP_PRICE_USD: 'Цена поставщика USD',
+    PRICE_BYN: 'Итоговая цена BYN',     // Финальная сумма к оплате клиентом
+    DELIVERY_COST: 'Оплата доставки BYN', // Для вычитания доставки в ВамЭкспресс
+    AD_ONLINER: 'Реклама Онлайнер'
+  },
+
+  SUPPLIERS: {
+    GIVE_MONEY: ['РТЕЧ', 'Iven', 'Технобай', 'Вадим', 'Игорь', 'Артем', 'Другое']
+  },
+
+  PAYMENT_TYPES: {
+    CASH: ['наличные', 'наличные чек']
+  },
+
+  SEND_MODE: {
+    QUEUE: 'queue',
+    FAST: 'fast'
+  }
+};
+
+// 🔥 ДОБАВИТЬ В НАЧАЛО (после CONFIG)
+const CACHE = CacheService.getScriptCache();
+const ONE_HOUR = 3600; // секунд
+
+// 🔥 ГЛОБАЛЬНЫЕ КОНСТАНТЫ ДЛЯ КЭША
+const CACHE_TTL = {
+  SHORT: 1800,    // 30 минут
+  MEDIUM: 3600,   // 1 час
+  LONG: 7200,     // 2 часа
+  DAY: 86400      // 24 часа
+};
+
+function TEST_USD_RATE() {
+  const rate = getUsdRateCached();
+  Logger.log('Текущий курс USD (НБРБ): ' + rate);
+}
+
+function testFolderAccess() {
+  const folder = DriveApp.getFolderById('1DXEKv6kDtnPdOQWKW0nLCrWoyaCCFNf_');
+  Logger.log('Folder name: ' + folder.getName());
+}
+
+function testDrive() {
+  DriveApp.getRootFolder().getName();
+}
+
+function grantDriveAuth() {
+  return DriveApp.getRootFolder().getName();
+}
+
+// 🔥 БЕЗОПАСНЫЙ reset_all_state С ЛОГИРОВАНИЕМ
+function reset_all_state() {
+  if (!CONFIG.DEBUG) {
+    sendMessage('❌ Сброс состояний запрещен в production режиме', null, CONFIG.CHAT_ID);
+    return;
+  }
+  
+  const ui = SpreadsheetApp.getUi();
+  const response = ui.alert(
+    '⚠️ ОПАСНО!',
+    'Вы действительно хотите сбросить ВСЕ состояния бота?\n\n' +
+    'Это удалит:\n' +
+    '• Очередь отправки сообщений\n' +
+    '• Дополнительные дела\n' +
+    '• Маршруты\n' +
+    '• Состояния диалогов\n' +
+    '• OCR состояния\n\n' +
+    'Действие НЕЛЬЗЯ отменить!',
+    ui.ButtonSet.YES_NO
+  );
+  
+  if (response !== ui.Button.YES) return;
+  
+  try {
+    // 🔥 ЛОГИРУЕМ ЧТО БЫЛО ДО УДАЛЕНИЯ
+    const allProps = scriptProps.getProperties();
+    const propCount = Object.keys(allProps).length;
+    
+    // Сохраняем критически важные данные
+    const backupData = {
+      timestamp: new Date().toISOString(),
+      propertiesCount: propCount
+    };
+    
+    // 🔥 СОЗДАЕМ ЛОГ В ТАБЛИЦЕ
+    writeReport('', '', 'Система', `Сброс состояний бота (удалено ${propCount} свойств)`, 'Система');
+    
+    // Удаляем все свойства
+    scriptProps.deleteAllProperties();
+    
+    // Очищаем CacheService - ИСПРАВЛЕННЫЙ КОД
+    try {
+      ['tg_queue_cache', 'column_indices', 'suppliers_data_v2', 'usd_rate']
+        .forEach(k => CACHE.remove(k));
+    } catch (e) {
+      console.warn('Не удалось очистить CacheService:', e);
+    }
+    
+    // 🔥 УВЕДОМЛЕНИЕ
+    const msg = `✅ Все состояния сброшены\n\n` +
+               `Удалено свойств: ${propCount}\n` +
+               `Время: ${new Date().toLocaleString('ru-RU')}\n` +
+               `Запись сохранена в Отчётах`;
+    
+    ui.alert('✅ Состояния сброшены', msg, ui.ButtonSet.OK);
+    
+    // Отправляем уведомление в Telegram
+    sendMessage(msg, null, CONFIG.CHAT_ID, CONFIG.SEND_MODE.FAST, null, { markdown: false });
+    
+  } catch (error) {
+    console.error('❌ Ошибка при сбросе состояний:', error);
+    ui.alert('❌ Ошибка', 'Не удалось сбросить состояния: ' + error.message, ui.ButtonSet.OK);
+  }
+}
+
+// 🔥 ОБНОВЛЕННАЯ initColumns С КЭШИРОВАНИЕМ
+function initColumns(force = false) {
+  if (!force && Object.keys(COL_IDX).length > 0) return COL_IDX;
+  
+  const cached = CACHE.get("column_indices");
+  if (!force && cached) {
+    COL_IDX = JSON.parse(cached);
+    return COL_IDX;
+  }
+  
+  try {
+    const sheet = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID).getSheetByName(CONFIG.SHEETS.ORDERS);
+    if (!sheet) throw new Error(`Не найдена таблица "${CONFIG.SHEETS.ORDERS}"`);
+    
+    // Берем заголовки со 2-й строки
+    const rawHeaders = sheet.getRange(2, 1, 1, sheet.getLastColumn()).getValues()[0];
+    
+    // 🔥 ОЧИСТКА: убираем переносы строк, двойные пробелы и невидимые символы
+    const headers = rawHeaders.map(h => 
+      String(h)
+        .replace(/[\r\n\t]+/g, ' ') // Заменяем переносы и табуляцию на пробел
+        .replace(/\s+/g, ' ')       // Заменяем двойные пробелы на один
+        .trim()
+    );
+    
+    console.log('🔍 Очищенные заголовки для поиска:', headers);
+    
+    for (const [key, name] of Object.entries(CONFIG.COLUMN_NAMES)) {
+      // Ищем точное совпадение очищенного имени
+      let idx = headers.indexOf(name.trim());
+      
+      // Если не нашли точно, пробуем найти по вхождению (на случай мелких несовпадений)
+      if (idx === -1) {
+        idx = headers.findIndex(h => h.toLowerCase().includes(name.toLowerCase().trim()));
+      }
+
+      if (idx === -1) {
+        console.error(`❌ Колонка "${name}" не найдена!`);
+        // Не кидаем ошибку сразу, даем боту шанс работать с тем, что нашел
+      } else {
+        COL_IDX[key] = idx;
+      }
+    }
+    
+    CACHE.put("column_indices", JSON.stringify(COL_IDX), ONE_HOUR);
+    return COL_IDX;
+    
+  } catch (error) {
+    console.error('❌ Ошибка инициализации колонок:', error);
+    throw error;
+  }
+}
+
+// 🔥 ФУНКЦИЯ ДЛЯ ПРИНУДИТЕЛЬНОГО ОБНОВЛЕНИЯ
+function refreshColumns() {
+  initColumns(true);
+  console.log('✅ Индексы колонок принудительно обновлены');
+  sendMessage('🔄 Индексы колонок обновлены', null, CONFIG.CHAT_ID, CONFIG.SEND_MODE.FAST, null, { markdown: false });
+}
+
+// 🔥 ДОБАВИТЬ В bot() меню
+function bot(ui) {
+  ui.createMenu('Бот')
+    .addItem('⚙️ Запустить выбранные заказы', 'sendOrdersToTelegram')
+    .addSeparator()
+    .addItem('✅ Очистить все статусы', 'reset_all_state')
+    .addItem('🔄 Обновить индексы колонок', 'refreshColumns')
+    .addItem('🧹 Очистить кэш колонок', 'clearColumnCache')
+    .addItem('🧹 Очистить старые свойства', 'cleanupOldProperties')
+    .addItem('💾 Проверить использование памяти', 'checkMemoryUsage')
+    .addItem('🗑️ Очистить папку OCR', 'manualCleanupOcr')
+    .addItem('🔍 Проверить здоровье бота', 'botHealthCheck')
+    .addSeparator()
+    .addItem('🔧 Установить триггеры', 'setupAllTriggers')
+    .addItem('⚠️ Проверить колонку статуса', 'checkStatusColumn') // 🔥 НОВАЯ ФУНКЦИЯ
+    .addToUi();
+  setBotCommands();
+  ensureQueueTrigger();
+}
+
+// 🔥 ОЧИСТКА КЭША КОЛОНОК
+function clearColumnCache() {
+  CACHE.remove("column_indices");
+  scriptProps.deleteProperty('COL_IDX_BACKUP');
+  COL_IDX = {};
+  console.log('✅ Кэш колонок очищен');
+  const ui = SpreadsheetApp.getUi();
+  ui.alert('✅ Кэш колонок очищен', 'При следующем запуске индексы будут пересчитаны.', ui.ButtonSet.OK);
+}
+
+// 🔥 АВТОМАТИЧЕСКОЕ БЭКАПИРОВАНИЕ ПРИ УСПЕШНОЙ ИНИЦИАЛИЗАЦИИ
+function backupColumnIndices() {
+  if (Object.keys(COL_IDX).length > 0) {
+    scriptProps.setProperty('COL_IDX_BACKUP', JSON.stringify(COL_IDX));
+    console.log('💾 Создан бэкап индексов колонок');
+  }
+}
+
+// Вызовите backupColumnIndices() после успешной initColumns()
+
+// ===================== ЕДИНЫЙ ЛОГГЕР ДЛЯ ТЕХНОБАЙ =====================
+function syncWithTechnoBay(date, info, amount, userName = '') {
+  try {
+    const sheet = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID).getSheetByName(CONFIG.SHEETS.TB);
+    if (!sheet) {
+      console.error('❌ Лист ТБ не найден');
+      // 🔥 В режиме DEBUG отправляем уведомление
+      if (CONFIG.DEBUG) {
+        sendMessage(`⚠️ Лист "${CONFIG.SHEETS.TB}" не найден. Запись Технобай не выполнена.`, 
+                   null, CONFIG.CHAT_ID, CONFIG.SEND_MODE.FAST, null, { markdown: false });
+      }
+      return;
+    }
+    
+    const finalAmount = typeof amount === 'number' ? amount : parsePrice(amount);
+    const finalInfo = userName ? `${info} (исп. ${userName})` : info;
+    
+    // 🔥 Проверяем, не пустые ли данные
+    if (!info || finalAmount === 0) {
+      console.warn(`⚠️ Попытка записи пустых данных в ТБ: ${info} - ${finalAmount}`);
+      return;
+    }
+    
+    sheet.appendRow([date, String(finalInfo).trim(), finalAmount]);
+    console.log(`📝 Запись в ТБ: ${date} | ${info} | ${finalAmount}`);
+    
+    // 🔥 В режиме DEBUG отправляем подтверждение
+    if (CONFIG.DEBUG) {
+      sendMessage(`✅ Технобай записан в лист ТБ:\n${date} | ${info} | ${finalAmount} BYN`, 
+                 null, CONFIG.CHAT_ID, CONFIG.SEND_MODE.FAST, null, { markdown: false });
+    }
+    
+  } catch (error) {
+    console.error('❌ Ошибка записи в Технобай:', error);
+    
+    // 🔥 Отправляем уведомление об ошибке в Telegram
+    if (CONFIG.DEBUG) {
+      sendMessage(`❌ Ошибка записи в лист ТБ:\n${error.message}`, 
+                 null, CONFIG.CHAT_ID, CONFIG.SEND_MODE.FAST, null, { markdown: false });
+    }
+  }
+}
+
+// 🔥 ФУНКЦИЯ ОЧИСТКИ ПАПКИ OCR
+function cleanUpOcrFolder(daysOld = 7) {
+  try {
+    const folder = DriveApp.getFolderById(CONFIG.OCR_FOLDER_ID);
+    const files = folder.getFiles();
+    const now = new Date();
+    let deletedCount = 0;
+    let errorCount = 0;
+    
+    while (files.hasNext()) {
+      const file = files.next();
+      const created = file.getDateCreated();
+      const ageInDays = (now - created) / (1000 * 60 * 60 * 24);
+      
+      if (ageInDays > daysOld) {
+        try {
+          file.setTrashed(true);
+          deletedCount++;
+        } catch (e) {
+          console.error(`Не удалось удалить файл ${file.getName()}:`, e);
+          errorCount++;
+        }
+      }
+    }
+    
+    console.log(`🧹 Очистка папки OCR: удалено ${deletedCount} файлов, ошибок: ${errorCount}`);
+    
+    if (CONFIG.DEBUG && deletedCount > 0) {
+      sendMessage(`🧹 Очистка папки OCR\nУдалено файлов: ${deletedCount}\nОшибок: ${errorCount}`, 
+                 null, CONFIG.CHAT_ID, CONFIG.SEND_MODE.FAST, null, { markdown: false });
+    }
+    
+    return { deleted: deletedCount, errors: errorCount };
+    
+  } catch (error) {
+    console.error('❌ Ошибка очистки папки OCR:', error);
+    return { deleted: 0, errors: 1 };
+  }
+}
+
+// 🔥 ТРИГГЕР ДЛЯ ЕЖЕНЕДЕЛЬНОЙ ОЧИСТКИ
+function setupCleanupTrigger() {
+  // Удаляем старые триггеры
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'cleanUpOcrFolder')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+  
+  // Создаем новый (каждое воскресенье в 3:00)
+  ScriptApp.newTrigger('cleanUpOcrFolder')
+    .timeBased()
+    .onWeekDay(ScriptApp.WeekDay.SUNDAY)
+    .atHour(3)
+    .create();
+  
+  console.log('✅ Триггер очистки папки OCR установлен (воскресенье 3:00)');
+}
+
+// 🔥 РУЧНАЯ ОЧИСТКА (добавить в меню)
+function manualCleanupOcr() {
+  const ui = SpreadsheetApp.getUi();
+  const response = ui.alert(
+    'Очистка папки OCR',
+    'Удалить все временные файлы старше 7 дней?',
+    ui.ButtonSet.YES_NO
+  );
+  
+  if (response === ui.Button.YES) {
+    const result = cleanUpOcrFolder(0); // 0 = удалить все
+    ui.alert(
+      'Готово',
+      `Удалено файлов: ${result.deleted}\nОшибок: ${result.errors}`,
+      ui.ButtonSet.OK
+    );
+  }
+}
+
+// 🔥 ФУНКЦИЯ ДЛЯ УСТАНОВКИ ВСЕХ ТРИГГЕРОВ
+function setupAllTriggers() {
+  ensureQueueTrigger();
+  setupCleanupTrigger();
+  
+  // 🔥 ДОБАВИТЬ ТРИГГЕР ДЛЯ АВТООЧИСТКИ СВОЙСТВ
+  setupPropertyCleanupTrigger();
+  
+  const ui = SpreadsheetApp.getUi();
+  ui.alert('✅ Триггеры установлены', 
+           '• Очередь сообщений: каждую минуту\n' +
+           '• Очистка OCR: каждое воскресенье 3:00\n' +
+           '• Очистка свойств: каждый день в 4:00',
+           ui.ButtonSet.OK);
+}
+
+// 🔥 ТРИГГЕР ДЛЯ ЕЖЕДНЕВНОЙ ОЧИСТКИ СВОЙСТВ
+function setupPropertyCleanupTrigger() {
+  // Удаляем старые триггеры
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'cleanupOldProperties')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+  
+  // Создаем новый (каждый день в 4:00)
+  ScriptApp.newTrigger('cleanupOldProperties')
+    .timeBased()
+    .everyDays(1)
+    .atHour(4)
+    .create();
+  
+  console.log('✅ Триггер очистки свойств установлен (ежедневно 4:00)');
+}
+
+function setBotCommands() {
+  const commands = [
+    { command: 'mapping', description: 'Маршрут' },
+    { command: 'vamexpress', description: 'ВамЭкспресс (Сверка)' },
+    { command: 'buy_usd', description: 'Обмен валюты' },
+    { command: 'give_money', description: 'Дать денег' },
+    { command: 'money', description: 'Баланс' },
+    { command: 'clear', description: 'Очистить чат' },
+    { command: 'cancel', description: 'Отмена' }
+  ];
+  UrlFetchApp.fetch(`https://api.telegram.org/bot${CONFIG.TOKEN}/setMyCommands`, {
+    method: 'post', contentType: 'application/json',
+    payload: JSON.stringify({ commands })
+  });
+}
+
+// ===================== TELEGRAM CORE =====================
+function sendTelegram(payload) {
+  try {
+    // 🔥 ПРЕДВАРИТЕЛЬНАЯ ПРОВЕРКА ТЕКСТА НА ОШИБКИ MARKDOWN
+    if (payload.parse_mode === 'MarkdownV2') {
+      // Проверяем незакрытые скобки и прочие ошибки
+      const text = payload.text || '';
+      const openBrackets = (text.match(/\[/g) || []).length;
+      const closeBrackets = (text.match(/\]/g) || []).length;
+      
+      if (openBrackets !== closeBrackets) {
+        console.warn('⚠️ Обнаружены незакрытые скобки Markdown, отключаю разметку');
+        delete payload.parse_mode;
+      }
+    }
+    
+    const resp = UrlFetchApp.fetch(`https://api.telegram.org/bot${CONFIG.TOKEN}/sendMessage`, {
+      method: 'post', 
+      contentType: 'application/json',
+      payload: JSON.stringify(payload), 
+      muteHttpExceptions: true
+    });
+    
+    // 🔥 АНАЛИЗ ОТВЕТА
+    const responseText = resp.getContentText();
+    let data = {};
+    try { 
+      data = JSON.parse(responseText); 
+    } catch(e) { 
+      logDebug('JSON parse error: ' + e.message + ', response: ' + responseText.substring(0, 200));
+      return { ok: false, description: 'Invalid JSON response' };
+    }
+    
+    // 🔥 АВТОМАТИЧЕСКОЕ ИСПРАВЛЕНИЕ MARKDOWN ОШИБОК
+    if (!data.ok && data.description && data.description.includes('parse_mode')) {
+      console.log('🔄 Markdown error detected, retrying without formatting');
+      
+      // Убираем Markdown и пробуем снова
+      delete payload.parse_mode;
+      const retryResp = UrlFetchApp.fetch(`https://api.telegram.org/bot${CONFIG.TOKEN}/sendMessage`, {
+        method: 'post', 
+        contentType: 'application/json',
+        payload: JSON.stringify(payload), 
+        muteHttpExceptions: true
+      });
+      
+      try {
+        return JSON.parse(retryResp.getContentText());
+      } catch(e) {
+        return { ok: false, description: 'Retry failed' };
+      }
+    }
+    
+    // 🔥 СОХРАНЯЕМ ID СООБЩЕНИЯ ДЛЯ КАРТОЧЕК
+    if (data.ok && payload._uid) {
+      const saved = getWithTTL(payload._uid);
+      if (saved) {
+        saved.messageId = data.result.message_id;
+        setWithTTL(payload._uid, saved, 480);
+      }
+    }
+    
+    return data;
+    
+  } catch(e) {
+    logDebug('sendTelegram error: ' + e.message);
+    return { ok: false, error: e.message };
+  }
+}
+
+function saveSentMessage(chatId, messageId) {
+  const key = `sent_msgs_${chatId}`;
+  const arr = getWithTTL(key) || [];
+  
+  // 🔥 УДАЛЯЕМ САМЫЕ СТАРЫЕ, ЕСЛИ ПЕРЕПОЛНЕНИЕ
+  if (arr.length >= 100) arr.shift(); 
+  
+  arr.push({ chat_id: chatId, message_id: messageId });
+  setWithTTL(key, arr, 1440);
+}
+
+function clearChat(chatId) {
+  const msgs = getWithTTL(`sent_msgs_${chatId}`) || [];
+  if (msgs.length === 0) {
+    sendMessage('Нет сообщений для очистки', null, chatId);
+    return;
+  }
+  
+  const maxDeletes = Math.min(20, msgs.length);
+  let deleted = 0;
+  
+  sendMessage(`🧹 Очищаю чат: ${msgs.length} сообщений...`, null, chatId);
+  
+  for (let i = 0; i < maxDeletes; i++) {
+    const m = msgs[i];
+    try {
+      UrlFetchApp.fetch(`https://api.telegram.org/bot${CONFIG.TOKEN}/deleteMessage`, {
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify({ 
+          chat_id: m.chat_id, 
+          message_id: m.message_id 
+        }),
+        muteHttpExceptions: true
+      });
+      deleted++;
+      Utilities.sleep(100);
+    } catch(e) {
+      logDebug(`Delete skipped (likely >48h): ${m.message_id}`);
+    }
+  }
+  
+  // Обновляем список оставшихся сообщений
+  const remaining = msgs.slice(maxDeletes);
+  if (remaining.length > 0) {
+    setWithTTL(`sent_msgs_${chatId}`, remaining, 1440);
+    sendMessage(`✅ Удалено: ${deleted} из ${msgs.length}\nОсталось: ${remaining.length}`, null, chatId);
+  } else {
+    scriptProps.deleteProperty(`sent_msgs_${chatId}`);
+    scriptProps.deleteProperty(`ttl_sent_msgs_${chatId}`);
+    sendMessage(`✅ Чат полностью очищен! Удалено: ${deleted} сообщений`, null, chatId);
+  }
+}
+
+function sendMessage(
+  text,
+  keyboard = null,
+  chatId = CONFIG.CHAT_ID,
+  mode = CONFIG.SEND_MODE.FAST,
+  uid = null,
+  opts = {}
+) {
+  const payload = {
+    chat_id: chatId,
+    text: text,
+    disable_web_page_preview: true,
+    ...(opts.markdown !== false && { parse_mode: 'MarkdownV2' }),
+    ...(keyboard && { reply_markup: keyboard }),
+    ...(uid && { _uid: uid })
+  };
+  
+  if (mode === CONFIG.SEND_MODE.QUEUE) {
+    addToQueue(payload);
+  } else {
+    try { 
+      sendTelegram(payload); 
+    } catch (e) { 
+      addToQueue(payload); 
+    }
+  }
+}
+
+// 🔥 ПЕРЕНОС ОЧЕРЕДИ TELEGRAM В CACHESERVICE
+function addToQueue(payload) {
+  const cacheKey = 'tg_queue_cache';
+  
+  try {
+    // Пробуем CacheService
+    const cached = CACHE.get(cacheKey);
+    let queue = cached ? JSON.parse(cached) : [];
+    queue.push(payload);
+    CACHE.put(cacheKey, JSON.stringify(queue), 3600); // 1 час
+    
+    // Дублируем в ScriptProperties для надежности
+    const propQueue = getWithTTL('tg_queue') || [];
+    propQueue.push(payload);
+    setWithTTL('tg_queue', propQueue, 60); // 1 час
+    
+    console.log(`📨 Сообщение добавлено в очередь (кэш). Длина очереди: ${queue.length}`);
+    
+  } catch (error) {
+    // Fallback на ScriptProperties
+    console.warn('CacheService для очереди недоступен, использую ScriptProperties');
+    const queue = getWithTTL('tg_queue') || [];
+    queue.push(payload);
+    setWithTTL('tg_queue', queue, 60);
+  }
+}
+
+// 🔥 БЕЗОПАСНАЯ processQueueFast БЕЗ ПОТЕРИ СООБЩЕНИЙ
+function processQueueFast() {
+  if (!lockService.tryLock(5000)) {
+    console.log('⏳ Очередь уже обрабатывается другим процессом');
+    return;
+  }
+  
+  try {
+    // 1. Получаем очередь из кэша (приоритет) или Properties
+    let queue = [];
+    let queueSource = 'cache';
+    
+    try {
+      const cached = CACHE.get('tg_queue_cache');
+      if (cached) {
+        queue = JSON.parse(cached);
+      }
+    } catch (e) {
+      console.warn('Не удалось получить очередь из CacheService:', e);
+    }
+    
+    // Если кэш пуст, пробуем Properties
+    if (!queue.length) {
+      queue = getWithTTL('tg_queue') || [];
+      queueSource = 'properties';
+    }
+    
+    // Защита от не-массивов
+    if (!Array.isArray(queue)) {
+      console.error('❌ Очередь не является массивом:', typeof queue);
+      // Сбрасываем поврежденные данные
+      if (queueSource === 'cache') {
+        CACHE.remove('tg_queue_cache');
+      } else {
+        scriptProps.deleteProperty('tg_queue');
+        scriptProps.deleteProperty('ttl_tg_queue');
+      }
+      return;
+    }
+    
+    if (!queue.length) {
+      return;
+    }
+    
+    console.log(`📨 Начало обработки очереди: ${queue.length} сообщений (источник: ${queueSource})`);
+    
+    // 2. Сохраняем копию для безопасности
+    const originalQueue = [...queue];
+    const maxMessages = Math.min(20, queue.length); // Ограничиваем за один запуск
+    const toProcess = queue.slice(0, maxMessages);
+    const remainingInQueue = queue.slice(maxMessages);
+    
+    let failed = [];
+    let sentCount = 0;
+    let errorCount = 0;
+    
+    // 3. Обрабатываем сообщения
+    for (let i = 0; i < toProcess.length; i++) {
+      const msg = toProcess[i];
+
+      try {
+        // 🔥 ДИАГНОСТИКА: логируем текст сообщения перед отправкой
+        if (CONFIG.DEBUG && i < 3) { // Только первые 3 сообщения
+          console.log(`🔍 Проверка сообщения ${i+1}:`, 
+            msg.text ? msg.text.substring(0, 100) : 'Нет текста');
+        }
+        
+        // 🔥 ПРОБНЫЙ РЕЖИМ: если DEBUG, проверяем Markdown
+        if (CONFIG.DEBUG && msg.parse_mode === 'MarkdownV2') {
+          const testText = msg.text || '';
+          const unsafePatterns = [
+            /\[[^\]]*$/m,  // незакрытая скобка
+            /\([^\)]*$/m,  // незакрытая круглая скобка
+            /(?<!\\)\./,   // неэкранированная точка
+            /(?<!\\)\-/,   // неэкранированный минус
+            /(?<!\\)\+/,   // неэкранированный плюс
+            /(?<!\\)=/,    // неэкранированный знак равенства
+          ];
+          
+          for (const pattern of unsafePatterns) {
+            if (pattern.test(testText)) {
+              console.warn(`⚠️ Обнаружен опасный символ в Markdown: ${pattern}`);
+              console.log(`   Текст: ${testText.substring(0, 200)}`);
+              // Автоматически экранируем опасные символы
+              msg.text = testText.replace(pattern, match => '\\' + match);
+            }
+          }
+        }
+        
+
+        
+        // 🔥 Мягкий sleep между сообщениями (80мс)
+        if (i > 0) Utilities.sleep(80);
+        
+        const data = sendTelegram(msg);
+        
+        if (!data.ok) {
+          // 🔥 Анализ ошибки
+          console.warn(`⚠️ Ошибка отправки: ${data.description || 'Unknown error'}`);
+          
+          // 429 Too Many Requests - прерываем всё, сохраняем всю очередь
+          if (data.error_code === 429) {
+            console.warn('⚠️ Достигнут лимит Telegram. Сохраняем всю очередь.');
+            // Возвращаем ВСЁ в очередь (и обработанные тоже!)
+            failed = failed.concat(toProcess.slice(i));
+            break;
+          }
+          
+          // Bad Request (Markdown/chat) - удаляем навсегда, НЕ возвращаем
+          if (data.description && (
+            data.description.includes('bad request') || 
+            data.description.includes('chat not found') ||
+            data.description.includes('parse_mode') ||
+            data.description.includes('Markdown')
+          )) {
+            console.error(`❌ Фатальная ошибка, удаляем сообщение: ${data.description}`);
+            continue;
+          }
+          
+          // Временная ошибка - пробуем до 3 раз
+          msg._tries = (msg._tries || 0) + 1;
+          if (msg._tries < 3) {
+            failed.push(msg);
+          } else {
+            console.warn(`❌ Сообщение удалено после 3 неудачных попыток`);
+          }
+          
+        } else {
+          // Успешная отправка
+          sentCount++;
+          
+          // 🔥 Сохраняем ID сообщения если нужно
+          if (msg._uid && data.result && data.result.message_id) {
+            const saved = getWithTTL(msg._uid);
+            if (saved) {
+              saved.messageId = data.result.message_id;
+              setWithTTL(msg._uid, saved, 480);
+            }
+          }
+        }
+        
+      } catch (e) {
+        console.error(`❌ Сбой системы при отправке: ${e.message}`);
+        errorCount++;
+        // При системной ошибке сохраняем сообщение
+        msg._tries = (msg._tries || 0) + 1;
+        if (msg._tries < 3) failed.push(msg);
+      }
+    }
+    
+    // 4. Формируем финальную очередь (ошибки + необработанные)
+    const finalQueue = failed.concat(remainingInQueue);
+    
+    // 5. Сохраняем в оба хранилища для надежности
+    if (finalQueue.length > 0) {
+      console.log(`📊 Сохраняем очередь: ${finalQueue.length} сообщений`);
+      
+      try {
+        // CacheService (основное)
+        CACHE.put('tg_queue_cache', JSON.stringify(finalQueue), 3600);
+        
+        // Properties (бэкап)
+        scriptProps.setProperty('tg_queue', JSON.stringify(finalQueue));
+        scriptProps.setProperty('ttl_tg_queue', String(Date.now() + 3600000));
+      } catch (e) {
+        console.error('❌ Ошибка сохранения очереди:', e);
+      }
+    } else {
+      // Очередь пуста - очищаем всё
+      console.log('✅ Очередь полностью обработана, очищаем хранилища');
+      
+      CACHE.remove('tg_queue_cache');
+      scriptProps.deleteProperty('tg_queue');
+      scriptProps.deleteProperty('ttl_tg_queue');
+    }
+    
+    // 6. Логируем результат
+    console.log(`📊 Итог обработки очереди:
+    • Отправлено: ${sentCount}
+    • Ошибок: ${errorCount}
+    • Сохранено в очередь: ${finalQueue.length}
+    • Удалено навсегда: ${toProcess.length - sentCount - failed.length}`);
+    
+    // 🔥 В DEBUG режиме отправляем отчет раз в 10 раз
+    if (CONFIG.DEBUG && Math.random() < 0.1) {
+      const report = `📊 Очередь Telegram:
+• Всего было: ${originalQueue.length}
+• Отправлено: ${sentCount}
+• Осталось: ${finalQueue.length}
+• Ошибок: ${errorCount}`;
+      
+      sendMessage(report, null, CONFIG.CHAT_ID, CONFIG.SEND_MODE.QUEUE, null, { markdown: false });
+    }
+    
+  } catch (error) {
+    console.error('❌ Критическая ошибка в processQueueFast:', error);
+    
+    // 🔥 В случае общей ошибки сохраняем очередь в Properties (более надежно)
+    try {
+      const emergencyQueue = getWithTTL('tg_queue') || [];
+      scriptProps.setProperty('tg_queue_emergency', JSON.stringify(emergencyQueue));
+      scriptProps.setProperty('ttl_tg_queue_emergency', String(Date.now() + 7200000));
+    } catch (e) {
+      // Последняя попытка
+    }
+    
+  } finally {
+    try {
+      lockService.releaseLock();
+    } catch (e) {
+      console.error('Не удалось освободить блокировку:', e);
+    }
+  }
+}
+
+// ===================== УТИЛИТЫ =====================
+// 🔥 ОБНОВЛЕННЫЙ setWithTTL С ПРИОРИТЕТАМИ
+function setWithTTL(key, value, min, useCache = false) {
+  const ttlMs = Date.now() + min * 60000;
+  
+  if (useCache && min <= 120) { // CacheService для короткоживущих данных (до 2 часов)
+    try {
+      const cacheKey = `cache_${key}`;
+      CACHE.put(cacheKey, JSON.stringify(value), min * 60);
+      // Дублируем в ScriptProperties для резерва
+      scriptProps.setProperty(key, JSON.stringify(value));
+      scriptProps.setProperty(`ttl_${key}`, String(ttlMs));
+    } catch (e) {
+      // Fallback на ScriptProperties
+      console.warn(`CacheService failed for ${key}, using ScriptProperties`);
+      scriptProps.setProperty(key, JSON.stringify(value));
+      scriptProps.setProperty(`ttl_${key}`, String(ttlMs));
+    }
+  } else {
+    // ScriptProperties для долгоживущих данных
+    scriptProps.setProperty(key, JSON.stringify(value));
+    scriptProps.setProperty(`ttl_${key}`, String(ttlMs));
+  }
+}
+
+// 🔥 ОБНОВЛЕННЫЙ getWithTTL С ПРОВЕРКОЙ TTL ДЛЯ CACHE
+function getWithTTL(key) {
+  // 1. Проверяем TTL в ScriptProperties (главный источник истины)
+  const ttl = scriptProps.getProperty(`ttl_${key}`);
+  
+  // Если TTL истек или нет - удаляем ВСЕ следы и возвращаем null
+  if (ttl && Date.now() > Number(ttl)) {
+    scriptProps.deleteProperty(key);
+    scriptProps.deleteProperty(`ttl_${key}`);
+    
+    // Удаляем из CacheService тоже
+    try {
+      CACHE.remove(`cache_${key}`);
+      CACHE.remove(key); // На всякий случай
+    } catch (e) {
+      // Игнорируем ошибки CacheService
+    }
+    
+    return null;
+  }
+  
+  // 2. Пробуем CacheService, но только если TTL актуален
+  try {
+    // Пробуем два возможных ключа кэша
+    const cacheKeys = [`cache_${key}`, key];
+    for (const cacheKey of cacheKeys) {
+      const cached = CACHE.get(cacheKey);
+      if (cached) {
+        // Дополнительная проверка: если есть TTL в Properties, проверяем его
+        if (ttl && Date.now() > Number(ttl)) {
+          CACHE.remove(cacheKey);
+          return null;
+        }
+        return JSON.parse(cached);
+      }
+    }
+  } catch (e) {
+    // Игнорируем ошибки CacheService
+  }
+  
+  // 3. Fallback на ScriptProperties (если TTL актуален или его нет)
+  const val = scriptProps.getProperty(key);
+  return val ? JSON.parse(val) : null;
+}
+
+// 🔥 УЛУЧШЕННАЯ ОЧИСТКА СТАРЫХ СВОЙСТВ
+function cleanupOldProperties() {
+  const allProps = scriptProps.getProperties();
+  const now = Date.now();
+  let deletedCount = 0;
+  let errorCount = 0;
+  
+  console.log(`🧹 Начинаю очистку свойств. Всего ключей: ${Object.keys(allProps).length}`);
+  
+  for (const key in allProps) {
+    if (key.startsWith('ttl_')) {
+      try {
+        const ttl = Number(allProps[key]);
+        if (ttl && now > ttl) {
+          const dataKey = key.replace('ttl_', '');
+          
+          // 🔥 УДАЛЯЕМ ОСНОВНОЙ КЛЮЧ И TTL
+          scriptProps.deleteProperty(dataKey);
+          scriptProps.deleteProperty(key);
+          
+          // 🔥 УДАЛЯЕМ ИЗ CACHESERVICE
+          try {
+            CACHE.remove(`cache_${dataKey}`);
+          } catch (e) {
+            // Игнорируем ошибки CacheService
+          }
+          
+          deletedCount++;
+          
+          // 🔥 ЛОГИРОВАНИЕ КАЖДЫЕ 50 КЛЮЧЕЙ
+          if (deletedCount % 50 === 0) {
+            console.log(`🧹 Очищено ${deletedCount} ключей...`);
+          }
+        }
+      } catch (error) {
+        console.error(`❌ Ошибка при обработке ключа ${key}:`, error);
+        errorCount++;
+      }
+    }
+  }
+  
+  console.log(`🧹 Очистка свойств завершена: удалено ${deletedCount} ключей, ошибок: ${errorCount}`);
+  
+  // 🔥 УВЕДОМЛЕНИЕ В ТЕЛЕГРАМ (только в DEBUG)
+  if (CONFIG.DEBUG && deletedCount > 0) {
+    const msg = `🧹 Очистка старых свойств завершена\n` +
+               `Удалено ключей: ${deletedCount}\n` +
+               `Ошибок: ${errorCount}\n` +
+               `Осталось ключей: ${Object.keys(scriptProps.getProperties()).length}`;
+    
+    sendMessage(msg, null, CONFIG.CHAT_ID, CONFIG.SEND_MODE.FAST, null, { markdown: false });
+  }
+  
+  return { deleted: deletedCount, errors: errorCount, remaining: Object.keys(scriptProps.getProperties()).length };
+}
+
+function mdSafe(text) { 
+  if (text === null || text === undefined) return '';
+  const str = String(text);
+  return str.replace(/([_*[\]()~`>#+\-=|{}.!])/g, '\\$1');
+}
+
+// Возвращаем число как число, чтобы Sheets мог считать суммы
+function formatNumber(num) {
+  if (num === '' || num === null || isNaN(num)) return '';
+  return Number(num);
+}
+
+function formatPriceForDisplay(num) {
+  if (num === '' || num === null || num === undefined) return '0,00';
+  // Если это строка, то преобразуем в число, используя parsePrice
+  const number = typeof num === 'string' ? parsePrice(num) : Number(num);
+  if (isNaN(number)) return '0,00';
+  // Форматируем с двумя знаками после запятой
+  return number.toFixed(2).replace('.', ',');
+}
+
+
+function parsePrice(text) {
+  if (typeof text === 'number') return text;
+  const clean = String(text || '').replace(',', '.').replace(/[^\d.]/g, '');
+  return Number(clean) || 0;
+}
+
+function normalizeSupplierName(name) {
+  if (!name && name !== 0) return '';
+  return String(name).trim().toLowerCase().replace(/\s+/g, '').replace(/[^0-9a-zа-яё]/gi, '');
+}
+
+function getToday() { return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'dd.MM.yyyy'); }
+
+function cleanAddress(addr) {
+  return String(addr || '').replace(/\(.*?\)/g, '').replace(/\s+/g, ' ').replace(/[,;]+/g, ',').trim();
+}
+
+// ===================== ЛОГИКА ЗАКАЗОВ =====================
+// ===================== ЗАПИСЬ ТЕХНОБАЙ (ОДНОКРАТНАЯ) =====================
+function logTechnoBayForTodayOnce() {
+  try {
+    if (Object.keys(COL_IDX).length === 0) {
+      initColumns();
+    }
+    
+    const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    const orderSheet = ss.getSheetByName(CONFIG.SHEETS.ORDERS);
+    if (!orderSheet) return;
+    
+    const lastRow = orderSheet.getLastRow();
+    if (lastRow < 3) return;
+    
+    const data = orderSheet.getRange(3, 1, lastRow - 2, orderSheet.getLastColumn()).getValues();
+    const todayStr = getToday();
+    const technoNorm = normalizeSupplierName('Технобай');
+    
+    let processedCount = 0;
+    let skippedCount = 0;
+    
+    data.forEach((row, i) => {
+      // Проверка даты
+      const d = row[COL_IDX.DATE];
+      let rowDateStr = '';
+      
+      if (d instanceof Date) {
+        rowDateStr = Utilities.formatDate(d, Session.getScriptTimeZone(), 'dd.MM.yyyy');
+      } else {
+        const dateStr = String(d || '').trim();
+        const dateMatch = dateStr.match(/(\d{1,2})[\.\/\-](\d{1,2})[\.\/\-](\d{4})/);
+        if (dateMatch) {
+          const [_, day, month, year] = dateMatch;
+          rowDateStr = `${String(day).padStart(2, '0')}.${String(month).padStart(2, '0')}.${year}`;
+        } else {
+          rowDateStr = dateStr;
+        }
+      }
+      
+      if (rowDateStr !== todayStr) return;
+      
+      // Проверка поставщика
+      const supName = String(row[COL_IDX.SUPPLIER] || '').trim();
+      if (normalizeSupplierName(supName) !== technoNorm) return;
+      
+      // Проверка номера заказа
+      const orderNum = String(row[COL_IDX.ORDER_NUM] || '').trim();
+      if (!orderNum) {
+        skippedCount++;
+        console.log(`⚠️ Пропускаем Технобай без номера заказа в строке ${i + 3}`);
+        return;
+      }
+      
+      // Проверка дубля
+      const tbKey = `tb_${orderNum}_${todayStr}`;
+      if (getWithTTL(tbKey)) {
+        skippedCount++;
+        console.log(`⏩ Пропускаем дубль Технобай: ${orderNum}`);
+        return;
+      }
+      
+      // Запись в лист ТБ
+      syncWithTechnoBay(todayStr, row[COL_IDX.MODEL], row[COL_IDX.SUP_PRICE_BYN]);
+      setWithTTL(tbKey, true, 1440);
+      processedCount++;
+      
+      console.log(`✅ Записан Технобай в ТБ: ${orderNum} - ${row[COL_IDX.MODEL]}`);
+    });
+    
+    if (CONFIG.DEBUG) {
+      sendMessage(`📊 Запись Технобая за ${todayStr}: ${processedCount} записей, ${skippedCount} пропущено`, 
+                 null, CONFIG.CHAT_ID, CONFIG.SEND_MODE.FAST, null, { markdown: false });
+    }
+    
+  } catch (error) {
+    console.error('❌ Ошибка в logTechnoBayForTodayOnce:', error);
+  }
+}
+
+// ===================== ОБНОВЛЕННАЯ collectSuppliersForToday =====================
+function collectSuppliersForToday() {
+  try {
+    if (Object.keys(COL_IDX).length === 0) {
+      initColumns();
+    }
+    
+    const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    const orderSheet = ss.getSheetByName(CONFIG.SHEETS.ORDERS);
+    
+    const lastRow = orderSheet.getLastRow();
+    if (lastRow < 2) return {};
+    
+    const data = orderSheet.getRange(3, 1, lastRow - 2, orderSheet.getLastColumn()).getValues();
+    const todayStr = getToday();
+    const supplierGroups = {};
+
+    data.forEach((row, i) => {
+      const d = row[COL_IDX.DATE];
+      let rowDateStr = '';
+      
+      if (d instanceof Date) {
+        rowDateStr = Utilities.formatDate(d, Session.getScriptTimeZone(), 'dd.MM.yyyy');
+      } else {
+        const dateStr = String(d || '').trim();
+        const dateMatch = dateStr.match(/(\d{1,2})[\.\/\-](\d{1,2})[\.\/\-](\d{4})/);
+        if (dateMatch) {
+          const [_, day, month, year] = dateMatch;
+          rowDateStr = `${String(day).padStart(2, '0')}.${String(month).padStart(2, '0')}.${year}`;
+        } else {
+          rowDateStr = dateStr;
+        }
+      }
+
+      if (rowDateStr !== todayStr) return;
+      
+      const supName = String(row[COL_IDX.SUPPLIER]).trim();
+      if (!supName) return;
+      
+      const supNorm = normalizeSupplierName(supName);
+
+      // 🔴 ВАЖНО: ТОЛЬКО группировка, БЕЗ записи в ТБ
+      if (!supplierGroups[supNorm]) {
+        supplierGroups[supNorm] = { 
+          name: supName,
+          items: [] 
+        };
+      }
+      supplierGroups[supNorm].items.push({ model: row[COL_IDX.MODEL] });
+    });
+    
+    return supplierGroups;
+    
+  } catch (error) {
+    console.error('❌ Ошибка в collectSuppliersForToday:', error);
+    return {};
+  }
+}
+
+function collectExtraTasksBySupplier() {
+  const sheet = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID).getSheetByName(CONFIG.SHEETS.EXTRA);
+  if (!sheet || sheet.getLastRow() < 2) return {};
+
+  const today = getToday();
+  const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, 6).getValues();
+  const map = {};
+
+  data.forEach((r, i) => {
+    const [date, art, sup, sum, cur, todo] = r;
+    if (!(date instanceof Date)) return;
+    if (Utilities.formatDate(date, Session.getScriptTimeZone(), 'dd.MM.yyyy') !== today) return;
+    
+    const supNorm = sup ? normalizeSupplierName(sup) : '__NO_SUPPLIER__';
+    const uid = `ex_${Utilities.getUuid().slice(0, 8)}`;
+    
+    // Сохраняем расширенные данные в кэш для дальнейшей обработки
+    setWithTTL(uid, { art, todo, sum, cur: cur || 'BYN', sup }, 480); // 🔥 8 часов
+
+    let text = `📌 *${mdSafe(art)}*\n${mdSafe(todo || sup)}`;
+    if (art === 'Точка' && sup) {
+      text += `\nПоставщик: ${mdSafe(sup)}`;
+    }
+    if (sum && art !== 'Точка') text += `\nСумма: ${formatNumber(sum)} ${cur || 'BYN'}`;
+
+    let kb;
+    if (art === 'Точка') {
+      kb = {
+        inline_keyboard: [
+          [
+            { text: '✅ Сделано', callback_data: `extra_done_${uid}` }, 
+            { text: '❌ Не сделано', callback_data: `extra_notdone_${uid}` }
+          ]
+        ]
+      };
+    } else {
+      kb = {
+        inline_keyboard: [
+          [{ text: '💰 Дал денег', callback_data: `extra_money_${uid}` }, { text: '❌ Не дал', callback_data: `extra_nomoney_${uid}` }],
+          [{ text: '✏️ Изменение суммы', callback_data: `extra_changesum_${uid}` }]
+        ]
+      };
+    }
+
+    if (!map[supNorm]) map[supNorm] = [];
+    map[supNorm].push({ text, kb, supName: sup, uid: uid });
+  });
+  return map;
+}
+
+// ===================== ОСНОВНАЯ ФУНКЦИЯ =====================
+function sendOrdersToTelegram() {
+   try {
+      // 🔥 0. ПРОВЕРКА ЗДОРОВЬЯ (только в debug режиме)
+      if (CONFIG.DEBUG && Math.random() < 0.1) { // 10% запусков
+        const health = botHealthCheck();
+        if (!health.allOk) {
+          console.warn('⚠️ Проблемы в проверке здоровья:', health.checks.filter(c => c.status === '❌'));
+        }
+      }
+
+      // 🔥 1. АВТОЛОГ ТЕХНОБАЙ ЗА СЕГОДНЯ
+      const todayKey = `tb_logged_${getToday()}`;
+      if (!getWithTTL(todayKey)) {
+        logTechnoBayForTodayOnce();
+        setWithTTL(todayKey, true, 1440);
+      } else {
+        console.log(`⏩ logTechnoBayForTodayOnce уже выполнен сегодня (${getToday()})`);
+      }
+      
+      // 🔥 2. ИНИЦИАЛИЗИРУЕМ КОЛОНКИ (с кэшированием)
+      initColumns();
+      
+      // 🔥 2. КЭШИРУЕМ ДАННЫЕ ПОСТАВЩИКОВ (ИСПРАВЛЕННЫЙ КОД)
+      const { supInfo } = getSuppliersData(); 
+
+    // 1. ✅ Заказы — ТОЛЬКО выделенные
+    const ordersSheet = SpreadsheetApp
+      .openById(CONFIG.SPREADSHEET_ID)
+      .getSheetByName(CONFIG.SHEETS.ORDERS);
+    
+    if (!ordersSheet) {
+      sendMessage('❌ Не найдена таблица "Заказы"', null, CONFIG.CHAT_ID);
+      return;
+    }
+    
+    // 🔥 ЖЕЛЕЗОБЕТОННОЕ ИСПРАВЛЕНИЕ: множественное выделение с fallback
+    const ss = SpreadsheetApp.getActive();
+    const selection = ss.getSelection();
+    
+    let ranges = [];
+    
+    // 1️⃣ Пробуем получить множественное выделение
+    const rangeList = selection?.getActiveRangeList();
+    if (rangeList && rangeList.getRanges().length) {
+      ranges = rangeList.getRanges();
+      console.log(`📌 Получили RangeList: ${ranges.length} диапазонов`);
+    }
+    
+    // 2️⃣ Fallback — меню "съело" выделение
+    if (!ranges.length) {
+      const activeRange = selection?.getActiveRange();
+      if (activeRange) {
+        ranges = [activeRange];
+        console.log(`📌 Fallback: получили ActiveRange: ${activeRange.getA1Notation()}`);
+      }
+    }
+    
+    // 3️⃣ Если вообще ничего
+    if (!ranges.length) {
+      sendMessage(
+        '❌ Выделение не найдено.\n\n' +
+        'Инструкция:\n' +
+        '1. Выдели строки с заказами (начиная с 3-й строки)\n' +
+        '2. Нажми меню "Бот" → "Запустить выбранные заказы"\n' +
+        '3. Не кликай никуда после выделения!',
+        null,
+        CONFIG.CHAT_ID
+      );
+      return;
+    }
+    
+    console.log(`✅ Найдено диапазонов: ${ranges.length}`);
+    ranges.forEach((r, i) => {
+      console.log(`  Диапазон ${i + 1}: ${r.getA1Notation()}, строк: ${r.getNumRows()}`);
+    });
+    
+    // Берём ТОЛЬКО реальные выделенные диапазоны
+    const rows = [];
+    const HEADER_ROWS = 2;
+    
+    ranges.forEach((r, rangeIndex) => {
+      const startRow = r.getRow();
+      const numRows = r.getNumRows();
+      
+      console.log(`📊 Обрабатываем диапазон ${rangeIndex + 1}: строка ${startRow}, строк ${numRows}`);
+      
+      if (startRow <= HEADER_ROWS && startRow + numRows - 1 <= HEADER_ROWS) {
+        console.log(`⏩ Пропускаем диапазон ${rangeIndex + 1} - только заголовки`);
+        return;
+      }
+      
+      // 🔥 Берем данные с правильным количеством колонок
+      const lastColumn = ordersSheet.getLastColumn();
+      const dataRange = ordersSheet.getRange(startRow, 1, numRows, lastColumn);
+      const data = dataRange.getValues();
+      
+      data.forEach((row, i) => {
+        const realRow = startRow + i;
+        
+        if (realRow <= HEADER_ROWS) {
+          console.log(`⏩ Пропускаем строку ${realRow} - заголовок`);
+          return;
+        }
+        
+        // 🔥 ИСПОЛЬЗУЕМ ДИНАМИЧЕСКИЕ ИНДЕКСЫ
+        const orderNum = row[COL_IDX.ORDER_NUM];
+        const model = row[COL_IDX.MODEL];
+        
+        if (!orderNum && !model) {
+          const supplier = row[COL_IDX.SUPPLIER];
+          const client = row[COL_IDX.CLIENT];
+          const address = row[COL_IDX.ADDRESS];
+          
+          if (!supplier && !client && !address) {
+            console.log(`⏩ Пропускаем строку ${realRow} - пустые данные`);
+            return;
+          }
+        }
+        
+        rows.push({
+          rowIndex: realRow,
+          row: row
+        });
+        
+        console.log(`✅ Добавлена строка ${realRow}: заказ "${orderNum}", модель "${model}"`);
+      });
+    });
+    
+    console.log(`📈 Всего найдено строк: ${rows.length}`);
+    
+    if (!rows.length) {
+      sendMessage(
+        '❌ В выделении нет строк с заказами\n\n' +
+        'Возможные причины:\n' +
+        '1. Выделены только заголовки (первые 2 строки)\n' +
+        '2. Выделены пустые строки\n' +
+        '3. Неверная вкладка - выделение не в таблице "Заказы"\n' +
+        '4. Нет данных в колонках "Номер заказа" или "Модель"\n\n' +
+        'Что делать:\n' +
+        '1. Перейди на вкладку "Заказы"\n' +
+        '2. Выдели реальные заказы (начиная с 31 строки)\n' +
+        '3. Запусти снова',
+        null, CONFIG.CHAT_ID
+      );
+      return;
+    }
+    
+    // 2. ✅ Поставщики — ВСЕ за сегодня
+    const supplierSums = collectSuppliersForToday();
+    
+    // 3. ✅ Доп-дела — ВСЕ за сегодня
+    const extraBySupplier = collectExtraTasksBySupplier();
+    
+    if (
+      !Object.keys(supplierSums).length &&
+      !Object.keys(extraBySupplier).length
+    ) {
+      sendMessage('ℹ️ Сегодня нет заборов у поставщиков', null, CONFIG.CHAT_ID, CONFIG.SEND_MODE.QUEUE);
+    }
+    
+    // 🔥 ЗАДАЧА 2: ДОП-ДЕЛА БЕЗ ПОСТАВЩИКА — В САМОМ НАЧАЛЕ
+    if (extraBySupplier['__NO_SUPPLIER__']) {
+      sendMessage('📌 *Дополнительные дела*', null, CONFIG.CHAT_ID, CONFIG.SEND_MODE.FAST);
+      
+      extraBySupplier['__NO_SUPPLIER__'].forEach(t => {
+        sendMessage(t.text, t.kb, CONFIG.CHAT_ID, CONFIG.SEND_MODE.FAST, t.uid);
+      });
+    }
+    
+    // 🔥 ОБРАБОТКА ВЫДЕЛЕННЫХ ЗАКАЗОВ
+    const groups = { vam: {}, auto: {}, normal: {} };
+    const today = getToday();
+    
+    rows.forEach(({ row, rowIndex }) => {
+      // 🔥 ИСПОЛЬЗУЕМ ДИНАМИЧЕСКИЕ ИНДЕКСЫ
+      const delivery = String(row[COL_IDX.DELIVERY] || '').toLowerCase();
+      const phone = String(row[COL_IDX.PHONE] || 'no_phone_' + rowIndex);
+      
+      const obj = {
+        row: rowIndex, 
+        orderNumber: row[COL_IDX.ORDER_NUM],
+        model: row[COL_IDX.MODEL], 
+        address: row[COL_IDX.ADDRESS],
+        price: parsePrice(row[COL_IDX.PRICE_BYN]),
+        deliveryPrice: parsePrice(row[COL_IDX.DELIVERY_COST]),
+        client: row[COL_IDX.CLIENT], 
+        payment: row[COL_IDX.PAYMENT],
+        phone: phone, 
+        supplier: row[COL_IDX.SUPPLIER],
+        comment: row[COL_IDX.COMMENT], 
+        adOnliner: row[COL_IDX.AD_ONLINER],
+        fromSource: row[COL_IDX.SOURCE], 
+        deliveryMethod: row[COL_IDX.DELIVERY]
+      };
+      
+      if (delivery.includes('вамэкспресс')) { 
+        if (!groups.vam[phone]) groups.vam[phone] = []; 
+        groups.vam[phone].push(obj); 
+      }
+      else if (delivery.includes('автолайт')) { 
+        if (!groups.auto[phone]) groups.auto[phone] = []; 
+        groups.auto[phone].push(obj); 
+      }
+      else { 
+        if (!groups.normal[phone]) groups.normal[phone] = []; 
+        groups.normal[phone].push(obj); 
+      }
+    });
+    
+    console.log(`📊 Группы: VAM=${Object.keys(groups.vam).length}, AUTO=${Object.keys(groups.auto).length}, NORMAL=${Object.keys(groups.normal).length}`);
+    
+    const orderedSuppliers = Object.keys(supplierSums)
+      .sort((a, b) => supplierSums[a].name.localeCompare(supplierSums[b].name, 'ru'));
+    
+    // 🔥 ОТПРАВКА БЛОКОВ ПОСТАВЩИКОВ (ВСЕ за сегодня)
+    if (orderedSuppliers.length > 0) {
+      for (const supNorm of orderedSuppliers) {
+        const supData = supplierSums[supNorm];
+        const supName = supData.name;
+        
+        const info = supInfo[supNorm] || {};
+        
+        let txt = `🧾 *${mdSafe(supName)}*\n` + (info.addr ? `📍 ${mdSafe(info.addr)}\n` : '') +
+                  (info.time ? `⏰ ${mdSafe(info.time)}\n` : '') + `\n🔽 *Забрать товар:*`;
+        supData.items.forEach(it => txt += `\n• ${mdSafe(it.model)}`);
+        sendMessage(txt, null, CONFIG.CHAT_ID, CONFIG.SEND_MODE.QUEUE);
+        
+        if (extraBySupplier[supNorm]) {
+          extraBySupplier[supNorm].forEach(t => {
+            sendMessage(t.text, t.kb, CONFIG.CHAT_ID, CONFIG.SEND_MODE.QUEUE, t.uid);
+          });
+        }
+
+      }
+    }
+    
+    // 🔥 Доп-дела для поставщиков без забора товара
+    for (const supNorm in extraBySupplier) {
+      if (supNorm === '__NO_SUPPLIER__') continue;
+      if (supplierSums[supNorm]) continue;
+      
+      const firstTask = extraBySupplier[supNorm][0];
+      const supName = firstTask?.supName || supNorm;
+   
+      const info = supInfo[supNorm] || {};
+      
+      let txt = `🧾 *${mdSafe(supName)}*\n`;
+      if (info.addr) txt += `📍 ${mdSafe(info.addr)}\n`;
+      if (info.time) txt += `⏰ ${mdSafe(info.time)}\n`;
+      
+      txt += `\n📝 *Дополнительные дела:*`;
+      
+      sendMessage(txt, null, CONFIG.CHAT_ID, CONFIG.SEND_MODE.QUEUE);
+      
+      extraBySupplier[supNorm].forEach(t => {
+        sendMessage(t.text, t.kb, CONFIG.CHAT_ID, CONFIG.SEND_MODE.QUEUE, t.uid);
+      });
+    }
+    
+    // 🔥 ОТПРАВКА ВЫДЕЛЕННЫХ ЗАКАЗОВ (группированных)
+    let totalSent = 0;
+    
+    if (Object.keys(groups.vam).length) { 
+      sendMessage('—————ВамЭкспресс—————', null, CONFIG.CHAT_ID, CONFIG.SEND_MODE.QUEUE); 
+      Object.values(groups.vam).forEach(a => {
+        sendCombinedOrdersMessage(a, 'vam');
+        totalSent += a.length;
+      }); 
+    }
+    if (Object.keys(groups.auto).length) { 
+      sendMessage('—————Автолайт—————', null, CONFIG.CHAT_ID, CONFIG.SEND_MODE.QUEUE); 
+      Object.values(groups.auto).forEach(a => {
+        sendCombinedOrdersMessage(a, 'autolight');
+        totalSent += a.length;
+      }); 
+    }
+    if (Object.keys(groups.normal).length) { 
+      sendMessage('—————По Минску—————', null, CONFIG.CHAT_ID, CONFIG.SEND_MODE.QUEUE); 
+      Object.values(groups.normal).forEach(a => {
+        sendCombinedOrdersMessage(a, 'normal');
+        totalSent += a.length;
+      }); 
+    }
+    
+  } catch (error) {
+    console.error('❌ Ошибка в sendOrdersToTelegram:', error);
+    
+    // 🔥 ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ ОШИБКИ
+    const errorMsg = `*❌ Критическая ошибка бота*\n\n` +
+                    `Ошибка: ${mdSafe(error.message)}\n` +
+                    `Стек: ${mdSafe(error.stack?.split('\n')[0] || 'нет')}\n\n` +
+                    `Время: ${new Date().toLocaleString('ru-RU')}`;
+    
+    sendMessage(errorMsg, null, CONFIG.CHAT_ID, CONFIG.SEND_MODE.FAST);
+    
+    // 🔥 ПРОБУЕМ ВОССТАНОВИТЬ КЭШ КОЛОНОК ПРИ ОШИБКЕ
+    try {
+      clearColumnCache();
+      console.log('🔄 Кэш колонок очищен после ошибки');
+    } catch (e) {
+      console.error('Не удалось очистить кэш:', e);
+    }
+  }
+}
+
+// 🔥 ОПТИМИЗАЦИЯ: кэширование данных поставщиков (ТОЛЬКО адреса и время)
+function getSuppliersData() {
+  const cacheKey = 'suppliers_data_v2';
+  const cached = CACHE.get(cacheKey);
+  if (cached) {
+    return JSON.parse(cached);
+  }
+  
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const supSheet = ss.getSheetByName(CONFIG.SHEETS.SUPPLIERS);
+  const supInfo = {};
+  
+  if (supSheet) {
+    const data = supSheet.getDataRange().getValues();
+    data.forEach((row, i) => { 
+      if (row[0]) {
+        const normName = normalizeSupplierName(row[0]);
+        // 🔴 ТОЛЬКО адрес и время, НЕ индексы строк
+        supInfo[normName] = { 
+          addr: row[1], 
+          time: row[2],
+          name: row[0]
+        };
+      }
+    });
+  }
+  
+  const result = { supInfo }; // 🔴 УБРАТЬ supplierRowMap
+  CACHE.put(cacheKey, JSON.stringify(result), 1800); // 30 минут
+  
+  return result;
+}
+
+function sendCombinedOrdersMessage(items, type) {
+  const first = items[0];
+  const totalPrice = items.reduce((s, o) => s + o.price, 0);
+  const nums = [...new Set(items.map(o => o.orderNumber))].join(', ');
+  const uid = Utilities.getUuid().split('-')[0];
+  
+  setWithTTL(uid, { 
+    rows: items.map(o => o.row), 
+    orderNumbers: nums, 
+    totalPrice, 
+    address: first.address, 
+    payment: first.payment, 
+    orderType: type, 
+    fullData: items,
+    phone: first.phone
+  }, 720);
+  
+  // 🔥 ИСПРАВЛЕНИЕ: ЭКРАНИРУЕМ ВСЕ ЧИСЛА И ПЕРЕМЕННЫЕ
+  let text = (type === 'normal') 
+    ? `*Заказы номер: ${mdSafe(nums)}*\n` + 
+      items.map(o => `📦 ${mdSafe(o.model)}`).join('\n') + 
+      `\nСумма: ${mdSafe(String(formatNumber(totalPrice)))} руб\\.\n` +
+      `Способ оплаты: ${mdSafe(first.payment)}\n` +
+      `Клиент: ${mdSafe(first.client)}\n` +
+      `Телефон: ${mdSafe(first.phone)}\n` +
+      `📍 ${mdSafe(first.address)}`
+    : items.map(o => `📦 ${mdSafe(o.model)}`).join('\n') + 
+      `\n📍 ${mdSafe(first.address)}\n` +
+      `Сумма: ${mdSafe(String(formatNumber(totalPrice)))} руб\\.`;
+  
+  // 🔥 ЭКРАНИРУЕМ КОММЕНТАРИЙ
+  if (first.comment) text += `\n_❗Комментарий:_ ${mdSafe(first.comment)}`;
+  
+  // 🔥 ЭКРАНИРУЕМ РЕКЛАМУ
+  if (type === 'normal' && needTryCancelOrder(first, totalPrice)) {
+    const adCost = (totalPrice * (Number(first.adOnliner) || 0)) / 100;
+    text += `\n\n‼️*Попробовать отменить заказ*\nРеклама: ${mdSafe(String(formatNumber(adCost)))} руб\\.`;
+  }
+  
+  let kb;
+  if (type === 'normal') {
+    kb = { 
+      inline_keyboard: [
+        [
+          { text: '👍 Доставлено', callback_data: `delivered_${uid}` }, 
+          { text: '💰 Цена изменена', callback_data: `pricechange_${uid}` }
+        ],
+        [
+          { text: '❌ Не доставлен', callback_data: `notdelivered_${uid}` }
+        ],
+        [
+          { text: '➕ В маршрут', callback_data: `routeadd_${uid}` }
+        ]
+      ]
+    };
+  } else { 
+    kb = { 
+      inline_keyboard: [
+        [
+          { text: '✅ Отправлено', callback_data: `${type}_${uid}` }
+        ],
+        [
+          { text: '❌ Не отправлен', callback_data: `notsent_${uid}` }
+        ]
+      ]
+    }; 
+  }
+  
+  sendMessage(text, kb, first.chatId || CONFIG.CHAT_ID, CONFIG.SEND_MODE.QUEUE, uid);
+}
+function needTryCancelOrder(o, totalPrice) {
+  if (!o.deliveryMethod || !o.fromSource) return false;
+  
+  const deliveryOk = String(o.deliveryMethod).toLowerCase().includes('курьер');
+  const src = String(o.fromSource).toLowerCase();
+  
+  if (!deliveryOk) return false;
+  if (!(src.includes('inote') || src.includes('tuf'))) return false;
+  
+  const adPercent = Number(o.adOnliner) || 0;
+  const adCost = (totalPrice * adPercent) / 100;
+  
+  return adCost > 100;
+}
+
+// ===================== OCR ЛОГИКА =====================
+function appendVamExpressGrouped(items) {
+  const sheet = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID).getSheetByName(CONFIG.SHEETS.ADDITIONAL);
+  const grouped = {};
+  items.forEach(o => {
+    const key = o.phone || 'unknown';
+    if (!grouped[key]) grouped[key] = { nums: new Set(), models: new Set(), price: 0, delivery: 0 };
+    grouped[key].nums.add(o.orderNumber); grouped[key].models.add(o.model);
+    if (CONFIG.PAYMENT_TYPES.CASH.includes(String(o.payment).toLowerCase())) grouped[key].price += Number(o.price) || 0;
+    grouped[key].delivery += Number(o.deliveryPrice) || 0;
+  });
+  for (const k in grouped) { sheet.appendRow([Array.from(grouped[k].nums).join(', '), Array.from(grouped[k].models).join('\n'), grouped[k].price, grouped[k].delivery]); }
+}
+
+function extractSumsSmart(text) {
+  const result = [];
+  const hasBrokenNumbers = /\d\.\d{2},\s*\d\.\d{2}/.test(text);
+  const hasZeroInTable = /0\.00\s+\d{2}\.\d{2}\s+\d{2}\.\d{2}/.test(text);
+  if (hasBrokenNumbers) text = text.replace(/(\d)\.(\d{2}),\s*(\d)\.(\d{2})/g, (_, a, b, c, d) => (a + b + c) + '.' + d);
+  text = text.replace(/(\d),(\d{3}\.)/g, '$1$2');
+  
+  // 🔥 ИСПРАВЛЕНИЕ: фильтруем NaN
+  const nums = (text.match(/\b\d+\.\d{2}\b/g) || [])
+    .map(n => Number(n))
+    .filter(n => !isNaN(n)); // ✅ ЗАЩИТА ОТ NaN
+  
+  for (let i = 0; i < nums.length - 2; i++) {
+    let sum = nums[i], fee = nums[i + 1], total = nums[i + 2];
+    if (sum < 50 && !(sum === 0 && hasZeroInTable)) continue;
+    if (fee < 10 || fee > 30) continue;
+    if (sum === 0 && hasZeroInTable && Math.abs(fee - Math.abs(total)) < 0.05) { 
+      result.push([0, fee, -Math.abs(total)]); 
+      i += 2; 
+      continue; 
+    }
+    if (Math.abs(sum - fee - total) < 0.05) { 
+      result.push([sum, fee, total]); 
+      i += 2; 
+      continue; 
+    }
+    if (total >= 100 && total <= 999 && sum > 1000) { 
+      if (Math.abs(sum - fee - (total + 1000)) < 0.05) { 
+        result.push([sum, fee, total + 1000]); 
+        i += 2; 
+      } 
+    }
+  }
+  return result.sort((a, b) => b[0] - a[0]);
+}
+
+function processVamExpressOCR(file) {
+  try {
+    const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    const ocrSheet = ss.getSheetByName(CONFIG.SHEETS.OCR_SUMS);
+    
+    // Очищаем старые данные
+    if (ocrSheet.getLastRow() > 1) {
+      ocrSheet.deleteRows(2, ocrSheet.getLastRow() - 1);
+    }
+    
+    // Создаем OCR документ
+    const doc = Drive.Files.copy(
+      { mimeType: 'application/vnd.google-apps.document' }, 
+      file.getId(), 
+      { ocr: true, ocrLanguage: 'ru' }
+    );
+    
+    // Получаем текст
+    const text = DocumentApp.openById(doc.id).getBody().getText();
+    
+    // 🔥 ПОЛНОЕ УДАЛЕНИЕ ДОКУМЕНТА (не в корзину)
+    try {
+      Drive.Files.remove(doc.id); // Используем Drive API для полного удаления
+      console.log(`🗑️ OCR документ полностью удален: ${doc.id}`);
+    } catch (e) {
+      console.warn('Не удалось полностью удалить OCR документ, помещаю в корзину');
+      DriveApp.getFileById(doc.id).setTrashed(true); // fallback
+    }
+    
+    // 🔥 УДАЛЯЕМ ИСХОДНЫЙ ФАЙЛ ИЗ ПАПКИ OCR
+    try {
+      file.setTrashed(true);
+      console.log(`🗑️ Исходный файл помещен в корзину: ${file.getName()}`);
+    } catch (e) {
+      console.warn('Не удалось удалить исходный файл:', e);
+    }
+    
+    const rows = extractSumsSmart(text);
+    if (rows.length) {
+      ocrSheet.getRange(2, 1, rows.length, 3).setValues(rows);
+    }
+    
+    return { count: rows.length };
+    
+  } catch (error) {
+    console.error('❌ Ошибка в processVamExpressOCR:', error);
+    
+    // 🔥 Отправляем уведомление об ошибке OCR
+    if (CONFIG.DEBUG) {
+      sendMessage(`❌ Ошибка обработки OCR:\n${error.message}`, 
+                 null, CONFIG.CHAT_ID, CONFIG.SEND_MODE.FAST);
+    }
+    
+    throw error;
+  }
+}
+
+// 🔥 БЕЗОПАСНАЯ editMessageFull С АВТОМАТИЧЕСКИМ ОТКЛЮЧЕНИЕМ MARKDOWN ПРИ ОШИБКАХ
+function editMessageFull(chatId, messageId, text, keyboard = null, useMarkdown = true) { 
+  try {
+    const payload = {
+      chat_id: chatId, 
+      message_id: messageId, 
+      text: text,
+      disable_web_page_preview: true
+    };
+    
+    // 🔥 АВТОПРОВЕРКА: если текст содержит опасные символы, отключаем Markdown
+    let finalUseMarkdown = useMarkdown;
+    if (useMarkdown) {
+      const unsafeChars = ['[', ']', '(', ')', '_', '*', '`', '~', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'];
+      const hasUnsafeChars = unsafeChars.some(char => 
+        text.includes(char) && !text.includes(`\\${char}`)
+      );
+      
+      if (hasUnsafeChars) {
+        console.log(`⚠️ Автоотключение Markdown: обнаружены опасные символы`);
+        finalUseMarkdown = false;
+      }
+    }
+    
+    if (finalUseMarkdown) {
+      payload.parse_mode = 'MarkdownV2';
+    }
+    
+    if (keyboard) {
+      payload.reply_markup = keyboard;
+    }
+    
+    const response = UrlFetchApp.fetch(`https://api.telegram.org/bot${CONFIG.TOKEN}/editMessageText`, { 
+      method: 'post', 
+      contentType: 'application/json', 
+      payload: JSON.stringify(payload), 
+      muteHttpExceptions: true 
+    });
+    
+    const data = JSON.parse(response.getContentText());
+    
+    // 🔥 АВТОИСПРАВЛЕНИЕ: если ошибка Markdown, пробуем без него
+    if (!data.ok && data.description && data.description.includes('parse_mode')) {
+      console.log(`🔄 Повторная попытка без Markdown (ошибка: ${data.description})`);
+      
+      delete payload.parse_mode;
+      const retryResponse = UrlFetchApp.fetch(`https://api.telegram.org/bot${CONFIG.TOKEN}/editMessageText`, { 
+        method: 'post', 
+        contentType: 'application/json', 
+        payload: JSON.stringify(payload), 
+        muteHttpExceptions: true 
+      });
+      
+      return JSON.parse(retryResponse.getContentText());
+    }
+    
+    return data;
+    
+  } catch(e) {
+    console.error('editMessageFull error:', e.message);
+    return { ok: false, error: e.message };
+  }
+}
+
+function reconcileVamExpress(realSum, userName = 'Система') { 
+  try {
+    const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    
+    // 🔥 ЗАЩИТА: проверяем OCR суммы
+    const ocrSums = ss.getSheetByName(CONFIG.SHEETS.OCR_SUMS).getDataRange().getValues().slice(1)
+      .map(r => {
+        const val = String(r[2] || '').replace(/\u00A0/g,'').replace(/\s/g,'').replace(',','.');
+        return Number(val);
+      })
+      .filter(v => !isNaN(v) && v > 0);
+    
+    if (!ocrSums.length) throw new Error('OCR не нашёл сумм в чеке');
+    
+    // 🔥 ЗАЩИТА: проверяем сумму
+    const finalReal = Math.round(Number(realSum) * 100) / 100;
+    if (isNaN(finalReal) || finalReal <= 0) {
+      throw new Error(`Некорректная сумма: ${realSum}`);
+    }
+    
+    const extraSheet = ss.getSheetByName(CONFIG.SHEETS.ADDITIONAL);
+    const extraData = extraSheet.getDataRange().getValues().slice(1);
+    
+    let matchedOrders = [], matchedSum = 0;
+    
+    for (let i = extraData.length - 1; i >= 0; i--) {
+      const orderSum = parsePrice(extraData[i][2]);
+      const delivery = parsePrice(extraData[i][3]);
+      const sumToGive = orderSum - delivery;
+      
+      const idx = ocrSums.findIndex(s => Math.abs(s - sumToGive) < 0.06);
+      if (idx !== -1) { 
+        matchedOrders.push(String(extraData[i][0] || '').trim()); 
+        matchedSum += sumToGive; 
+        extraSheet.deleteRow(i + 2); 
+        updateStatusByOrderNum(extraData[i][0], 'Продан'); 
+        ocrSums.splice(idx, 1); 
+      }
+    }
+    
+    // 🔥 ЗАЩИТА: проверяем matchedOrders перед join
+    const ordersStr = matchedOrders.length > 0 ? matchedOrders.join(', ') : 'нет заказов';
+    
+    const status = (Math.abs(matchedSum - finalReal) < 0.1) ? 'Забрал с ВамЭкспресс' : '⚠️ Суммы не свелись';
+    
+    // 🔥 ЗАЩИТА: userName всегда есть
+    const finalUserName = userName || 'Система';
+    
+    writeReport(finalReal, '', status, ordersStr, finalUserName); 
+    
+    return { 
+      matchedSum, 
+      realSum: finalReal, 
+      orders: matchedOrders,
+      status: status
+    };
+    
+  } catch (error) {
+    console.error('❌ Ошибка в reconcileVamExpress:', error);
+    throw error; // 🔥 Пробрасываем выше для обработки в handleDialogs
+  }
+}
+
+// ===================== ОБРАБОТЧИКИ =====================
+function doPost(e) {
+  try {
+    const update = JSON.parse(e.postData.contents);
+    
+    // 1. Обработка кнопок (Callback)
+    if (update.callback_query) return handleCallback(update.callback_query);
+    
+    // 2. Обработка сообщений
+    if (!update.message) return;
+    const msg = update.message;
+    const chatId = msg.chat.id;
+    const text = (msg.text || '').trim();
+    const userName = msg.from.first_name || 'Аноним'; // 🔥 Берем имя отправителя
+    
+    if (msg.photo) return handleVamPhoto(msg);
+    if (text.startsWith('/')) return handleCommand(text, chatId);
+    
+    // 🔥 Передаем userName в диалоги
+    if (handleDialogs(text, chatId, userName)) return;
+    
+  } catch (err) { 
+    logDebug('doPost Error: ' + err); 
+    console.error(err);
+  }
+}
+
+function handleCommand(text, chatId) {
+  const cmd = text.trim().split(/\s+/)[0].split('@')[0].toLowerCase();
+  switch (cmd) {
+    case '/give_money': setWithTTL(`gm_step_${chatId}`, 'ask_sum', 30); 
+      sendMessage('💸 Сколько дал денег?', null, chatId, CONFIG.SEND_MODE.FAST, null, { markdown: false }); 
+    break;
+    case '/buy_usd': setWithTTL(`buyusd_step_${chatId}`, 'ask_byn', 30); 
+      sendMessage('Сколько дал BYN?', null, chatId); 
+    break;
+    case '/mapping': buildRoute(chatId); 
+    break;
+    case '/vamexpress': setWithTTL(`vam_step_${chatId}`, 'vam_wait_photo', 30); 
+      sendMessage('📸 Пришлите фото отчёта ВамЭкспресс', null, chatId); 
+    break;
+    case '/money': sendMoneyBalance(chatId); 
+    break;
+    case '/clear': clearChat(chatId); 
+    break;
+    case '/cancel': clearStates(chatId); 
+      sendMessage('❌ Отменено', null, chatId, CONFIG.SEND_MODE.FAST, null, { markdown: false });
+    break;
+  }
+}
+
+// 🔥 ОБНОВЛЕННЫЙ handleCallback С СОХРАНЕНИЕМ ИМЕНИ
+function handleCallback(cb) {
+  // 🔥 Анти-даблклик: мгновенно отвечаем Telegram
+  try { answerCb(cb.id, "⏳ Секунду..."); } catch(e) {}
+
+  if (!userLockService.tryLock(2000)) return;
+  
+  try {
+    const chatId = cb.message.chat.id;
+    const msgId = cb.message.message_id;
+    const data = cb.data;
+    const userName = cb.from.first_name || 'Аноним';
+
+  // ================= DELIVERED =================
+  if (data.startsWith('delivered_')) {
+        const uid = data.split('_')[1];
+        const saved = getWithTTL(uid);
+        
+        if (!saved) {
+          return answerCb(cb.id, '❌ Ошибка: Данные заказа устарели. Нажмите кнопку заново.');
+        }
+      
+        let sum = getWithTTL(`real_price_${uid}`) || saved.totalPrice;
+    const isCash = CONFIG.PAYMENT_TYPES.CASH.includes(String(saved.payment).toLowerCase());
+    
+    writeReport(isCash ? sum : '', '', isCash ? 'Продажа' : `Продажа ${saved.payment}`, saved.orderNumbers, userName);
+    
+    saved.orderNumbers.split(',').forEach(num => updateStatusByOrderNum(num.trim(), 'Продан'));
+    
+    // 🔥 ИСПРАВЛЕНО: единый вызов вместо двух отдельных
+    editMessageFull(
+      chatId, 
+      msgId, 
+      `✅ Заказ ${mdSafe(saved.orderNumbers)} доставлен (исп. ${userName})`, 
+      null, 
+      false
+    );
+    
+    clearStates(chatId, uid);
+    return answerCb(cb.id, '');
+  }
+
+  // ================= PRICE CHANGE =================
+  if (data.startsWith('pricechange_')) {
+    const uid = data.split('_')[1];
+    
+    if (getWithTTL(`real_price_${uid}`)) {
+      return answerCb(cb.id, '⚠️ Цена уже была изменена ранее');
+    }
+    
+    if (getWithTTL(`price_step_${chatId}`)) {
+      return answerCb(cb.id, '❌ Вы уже вводите цену для другого заказа');
+    }
+    
+    setWithTTL(`price_step_${chatId}`, uid, 30);
+    editMessageReplyMarkup(chatId, msgId, { inline_keyboard: [] });
+    sendMessage(`💰 Введите реальную сумму для заказа ${getWithTTL(uid).orderNumbers}`, null, chatId);
+    return answerCb(cb.id, '');
+  }
+
+  // ================= NOT DELIVERED / NOT SENT =================
+  if (data.startsWith('notdelivered_') || data.startsWith('notsent_')) {
+    const uid = data.split('_')[1];
+    const saved = getWithTTL(uid);
+    if (!saved) return answerCb(cb.id, 'Устарело');
+    
+    const reportLabel = data.includes('notdelivered')
+      ? 'Не доставлен'
+      : 'Не отправлен';
+
+    writeReport('', '', reportLabel, saved.orderNumbers, userName);
+
+    saved.orderNumbers.split(',').forEach(num => {
+      updateStatusByOrderNum(num.trim(), 'Не продан');
+    });
+    
+    // 🔥 ИСПРАВЛЕНО: единый вызов
+    editMessageFull(
+      chatId, 
+      msgId, 
+      `❌ Заказ ${saved.orderNumbers} → ${reportLabel}`, 
+      { inline_keyboard: [] }, // Убираем кнопки
+      false
+    );
+    
+    clearStates(chatId, uid);
+    return answerCb(cb.id, '');
+  }
+
+  // ================= ROUTE ADD =================
+  if (data.startsWith('routeadd_')) {
+    const uid = data.split('_')[1];
+    const saved = getWithTTL(uid);
+    if (!saved) return answerCb(cb.id, 'Устарело');
+    
+    const key = `route_${CONFIG.CHAT_ID}`;
+    const route = getWithTTL(key) || [];
+    
+    if (!route.includes(saved.address)) {
+      route.push(saved.address);
+      setWithTTL(key, route, 720);
+      
+      const markup = cb.message.reply_markup;
+      markup.inline_keyboard.forEach(row => row.forEach(btn => {
+        if (btn.callback_data.includes('routeadd_')) {
+          btn.text = '✔️ В списке';
+          btn.callback_data = 'noop';
+        }
+      }));
+      editMessageReplyMarkup(chatId, msgId, markup);
+      return answerCb(cb.id, '📍 Адрес добавлен в общий маршрут');
+    } else {
+      return answerCb(cb.id, 'Уже в списке');
+    }
+  }
+
+  // ================= CLEAR ROUTE =================
+  if (data === 'clear_route_confirm') {
+    const key = `route_${CONFIG.CHAT_ID}`;
+    scriptProps.deleteProperty(key);
+    scriptProps.deleteProperty(`ttl_${key}`);
+    
+    editMessageText(chatId, msgId, '✅ *Общий маршрут полностью очищен*', true);
+    return answerCb(cb.id, 'Маршрут удален');
+  }
+
+  // ================= VAM EXPRESS =================
+  if (data.startsWith('vam_')) {
+    const uid = data.replace('vam_', '');
+    const saved = getWithTTL(uid);
+    if (!saved) return answerCb(cb.id, 'Устарело');
+    
+    updateOrderStatus(saved.rows, 'ВамЭкспресс');
+    writeReport('', '', 'Отправили на ВамЭкспресс', saved.orderNumbers, userName);
+    appendVamExpressGrouped(saved.fullData);
+    
+    // 🔥 ИСПРАВЛЕНО: единый вызов
+    editMessageFull(
+      chatId, 
+      msgId, 
+      `📦 Заказ ${saved.orderNumbers} уехал на ВамЭкспресс`, 
+      { inline_keyboard: [] }, 
+      false
+    );
+    
+    return answerCb(cb.id, '');
+  }
+
+  // ================= AUTOLIGHT =================
+  if (data.startsWith('autolight_')) {
+    const uid = data.replace('autolight_', '');
+    const saved = getWithTTL(uid);
+    if (!saved) return answerCb(cb.id, 'Устарело');
+    
+    updateOrderStatus(saved.rows, 'Автолайт');
+    writeReport('', '', 'Отправили на Автолайт', saved.orderNumbers, userName);
+    
+    // 🔥 ИСПРАВЛЕНО: единый вызов
+    editMessageFull(
+      chatId, 
+      msgId, 
+      `🚛 Заказ ${saved.orderNumbers} уехал на Автолайт`, 
+      { inline_keyboard: [] }, 
+      false
+    );
+    
+    return answerCb(cb.id, '');
+  }
+
+  // ================= GIVE MONEY SUPPLIER =================
+// В функции handleCallback найти блок GIVE MONEY SUPPLIER:
+if (data.startsWith('gm_supplier_')) {
+  const sup = data.replace('gm_supplier_', '');
+  const sum = Number(getWithTTL(`gm_sum_${chatId}`));
+
+    // 🔥 ЕСЛИ ВЫБРАЛИ "ДРУГОЕ" — СПРАШИВАЕМ КОМУ
+    if (sup === 'Другое') {
+      setWithTTL(`gm_step_${chatId}`, 'ask_other_name', 30);
+      setWithTTL(`gm_sum_${chatId}`, sum, 30);
+
+      editMessageText(chatId, msgId, `✏️ Кому именно дал ${sum}?`, false);
+      editMessageReplyMarkup(chatId, msgId, { inline_keyboard: [] });
+
+      return answerCb(cb.id, '');
+    }
+
+    // ===== ОБЫЧНЫЙ СЦЕНАРИЙ =====
+    // Упрощенная версия БЕЗ USD логики
+    writeReport(
+      -sum,
+      '',
+      'Дать денег',
+      sup || 'Без поставщика',
+      userName
+    );
+
+    // 🔥 если выбран поставщик и это Технобай
+    if (sup && normalizeSupplierName(sup) === normalizeSupplierName('Технобай')) {
+      syncWithTechnoBay(
+        getToday(),
+        'Выплата (бот)',
+        -sum,
+        userName
+      );
+    }
+
+    editMessageText(chatId, msgId, `✅ Записано: Дал ${sum} BYN → ${sup}`, false);
+    editMessageReplyMarkup(chatId, msgId, { inline_keyboard: [] });
+    clearStates(chatId);
+    return answerCb(cb.id, '');
+  }
+
+  // ================= EXTRA DONE / NOT DONE =================
+  if (data.startsWith('extra_done_') || data.startsWith('extra_notdone_')) {
+    const isDone = data.startsWith('extra_done_');
+    const uid = data.split('_').slice(2).join('_');
+    const task = getWithTTL(uid);
+    if (!task) return answerCb(cb.id, 'Устарело');
+
+    const statusText = isDone ? 'Сделано' : 'Не сделано';
+    writeReport('', '', 'Точка', `${statusText} -> ${task.todo}`, userName);
+
+    // 🔥 ИСПРАВЛЕНО: единый вызов с Markdown
+    editMessageFull(
+      chatId, 
+      msgId, 
+      `${isDone ? '✅' : '❌'} *${task.todo}* — ${statusText}`, 
+      { inline_keyboard: [] }, 
+      true // Markdown включен
+    );
+    
+    // 🔥 ОЧИЩАЕМ КЭШ ЗАДАЧИ
+    scriptProps.deleteProperty(uid);
+    scriptProps.deleteProperty(`ttl_${uid}`);
+    return answerCb(cb.id, statusText);
+  }
+
+  // ================= EXTRA MONEY (ДАЛ / НЕ ДАЛ) =================
+  if (data.startsWith('extra_money_')) {
+    const uid = data.split('_').slice(2).join('_');
+    const task = getWithTTL(uid);
+    if (!task) return answerCb(cb.id, 'Устарело');
+
+    const sum = Math.abs(Number(task.sum) || 0);
+    const isUsd = String(task.cur).toUpperCase() === 'USD';
+    
+    writeReport(
+      isUsd ? '' : -sum, 
+      isUsd ? -sum : '', 
+      task.art || 'Дать денег', 
+      task.todo || task.sup, 
+      userName
+    );
+
+    // 🔥 если указан поставщик и это Технобай
+    if (task.sup && normalizeSupplierName(task.sup) === normalizeSupplierName('Технобай')) {
+      syncWithTechnoBay(
+        getToday(),
+        task.todo || 'Выплата',
+        -sum,
+        userName
+      );
+    }
+    
+    // 🔥 ИСПРАВЛЕНО: единый вызов
+    editMessageFull(
+      chatId, 
+      msgId, 
+      `✅ Дал денег: ${task.todo || task.sup} (${sum} ${task.cur})`, 
+      { inline_keyboard: [] }, 
+      false
+    );
+    
+    // 🔥 ОЧИЩАЕМ КЭШ ЗАДАЧИ
+    scriptProps.deleteProperty(uid);
+    scriptProps.deleteProperty(`ttl_${uid}`);
+    return answerCb(cb.id, 'Записано');
+  }
+
+  if (data.startsWith('extra_nomoney_')) {
+    const uid = data.split('_').slice(2).join('_');
+    const task = getWithTTL(uid);
+    if (!task) return answerCb(cb.id, 'Устарело');
+
+    writeReport('', '', task.art || 'Дать денег', `Не дал -> ${task.todo || task.sup}`, userName);
+    
+    // 🔥 ИСПРАВЛЕНО: единый вызов с Markdown
+    editMessageFull(
+      chatId, 
+      msgId, 
+      `❌ *${task.todo || task.sup}* — Деньги не давал`, 
+      { inline_keyboard: [] }, 
+      true // Markdown включен
+    );
+    
+    // 🔥 ОЧИЩАЕМ КЭШ ЗАДАЧИ
+    scriptProps.deleteProperty(uid);
+    scriptProps.deleteProperty(`ttl_${uid}`);
+    return answerCb(cb.id, 'Отменено');
+  }
+
+  // ================= EXTRA CHANGE SUM (ИЗМЕНЕНИЕ СУММЫ) =================
+  if (data.startsWith('extra_changesum_')) {
+    const uid = data.split('_').slice(2).join('_');
+    
+    // 🔥 ЗАЩИТА ОТ ПОВТОРНОГО НАЖАТИЯ
+    if (getWithTTL(`extra_edit_sum_${chatId}`)) {
+      return answerCb(cb.id, '⏳ Уже жду сумму');
+    }
+    
+    const task = getWithTTL(uid);
+    if (!task) return answerCb(cb.id, 'Устарело');
+
+    setWithTTL(`extra_edit_sum_${chatId}`, uid, 5); // Состояние ожидания суммы на 5 мин
+    sendMessage(`✏️ Введите новую сумму для:\n*${mdSafe(task.todo || task.sup)}*`, null, chatId);
+    return answerCb(cb.id, 'Жду сумму...');
+  }
+
+  // ================= UNKNOWN COMMAND =================
+  logDebug(`Unknown callback [chat ${chatId}]: ${data}`);
+
+  return answerCb(cb.id, 'Неизвестная команда');
+  } finally {
+      try { userLockService.releaseLock(); } catch(e) {}
+    }
+}
+
+function handleDialogs(text, chatId, userName = 'Пользователь') {
+
+  if (text.startsWith('/')) return false;
+
+// ================= VAM EXPRESS SUM (ПЕРВЫМ!) =================
+  if (getWithTTL(`vam_step_${chatId}`) === 'vam_wait_sum') {
+    const val = parsePrice(text);
+
+    if (isNaN(val) || val <= 0) {
+      sendMessage('❌ Введите корректную сумму (число)', null, chatId);
+      return true;
+    }
+
+    try {
+      // Показываем пользователю, что мы начали сверку (чтобы не было тишины)
+      sendMessage('⏳ Сверяю данные, подождите...', null, chatId, CONFIG.SEND_MODE.FAST, null, { markdown: false });
+      
+       // 🔥 ПЕРЕДАЕМ userName (который теперь приходит в аргументы handleDialogs)
+      const res = reconcileVamExpress(val, userName); 
+      
+      const successMsg = `🧾 Сверка завершена!\n` +
+                        `• Найдено в чеке: ${res.matchedSum} руб\n` +
+                        `• Введено вами: ${res.realSum} руб\n` +
+                        `• Заказов обработано: ${res.orders.length}\n` +
+                        `• Выполнил: ${userName}\n\n` +
+                        `${res.matchedSum === res.realSum ? '✅ Суммы сошлись' : '⚠️ Есть расхождения'}`;
+      
+      sendMessage(successMsg, null, chatId, CONFIG.SEND_MODE.FAST, null, { markdown: false });
+
+    } catch (e) {
+      console.error('Ошибка сверки:', e);
+      sendMessage(`❌ Ошибка сверки: ${e.message}`, null, chatId, CONFIG.SEND_MODE.FAST, null, { markdown: false });
+    }
+
+    scriptProps.deleteProperty(`vam_step_${chatId}`);
+    scriptProps.deleteProperty(`ttl_vam_step_${chatId}`);
+    return true;
+  }
+
+    // 🔥 ЗАЩИТА: не обрабатываем команды
+    if (text.startsWith('/')) return false;
+    
+    // 1. ПЕРЕХВАТ ИЗМЕНЕНИЯ СУММЫ ДОП. ДЕЛ
+    const editUid = getWithTTL(`extra_edit_sum_${chatId}`);
+
+    if (editUid) {
+      if (!/[\d,.]/.test(text)) {
+        sendMessage('❌ Введите число', null, chatId);
+        return true;
+      }
+    const val = parsePrice(text);
+    const task = getWithTTL(editUid);
+    if (!task) {
+      scriptProps.deleteProperty(`extra_edit_sum_${chatId}`);
+      return false;
+    }
+    if (isNaN(val) || val <= 0) {
+      sendMessage('❌ Введите корректное число больше 0', null, chatId);
+      return true;
+    }
+
+    const cur = String(task.cur || 'BYN').toUpperCase();
+    const isUsd = cur === 'USD';
+    
+    // Записываем в отчет
+    writeReport(
+      isUsd ? '' : -val, 
+      isUsd ? -val : '', 
+      task.art || 'Дать денег', 
+      `Изм. суммы -> ${task.todo || task.sup} (было ${task.sum}, стало ${val})`, userName); // 🔥 ДОБАВЛЕНО userName
+
+    // Если Технобай - синхронизируем лист ТБ
+    if (!task.tbWritten && normalizeSupplierName(task.sup) === normalizeSupplierName('Технобай')) {
+      syncWithTechnoBay(getToday(), `Изм. суммы: ${task.todo || 'Выплата'}`, -val, userName); // Добавь userName в конец
+      task.tbWritten = true;
+      setWithTTL(editUid, task, 480);
+    }
+
+    // Обновляем оригинальное сообщение (удаляем кнопки)
+    if (task.messageId) {
+      editMessageText(chatId, task.messageId, `✅ Сумма изменена: *${val} ${cur}* для ${task.todo || task.sup}`, true);
+      editMessageReplyMarkup(chatId, task.messageId, { inline_keyboard: [] });
+    }
+
+    sendMessage(`✅ Сумма *${val} ${cur}* успешно записана в отчет\.`, null, chatId);
+    
+    // 🔥 ОЧИЩАЕМ ОБА КЭША (и состояние диалога, и задачу)
+    scriptProps.deleteProperty(`extra_edit_sum_${chatId}`);
+    scriptProps.deleteProperty(editUid);
+    scriptProps.deleteProperty(`ttl_${editUid}`);
+    return true;
+  }
+  
+  // 2. ПЕРЕХВАТ ИЗМЕНЕНИЯ ЦЕНЫ ЗАКАЗА
+  const priceUid = getWithTTL(`price_step_${chatId}`);
+  if (priceUid) {
+    const val = parsePrice(text);
+    if (isNaN(val) || val === 0) {
+      sendMessage('Введите корректное число', null, chatId);
+      return true;
+    }
+    setWithTTL(`real_price_${priceUid}`, val, 60); 
+    scriptProps.deleteProperty(`price_step_${chatId}`);
+    
+    const saved = getWithTTL(priceUid);
+    if (saved && saved.messageId) {
+      const kb = { inline_keyboard: [
+        [{ text: `👍 Доставлено (изм. на ${val})`, callback_data: `delivered_${priceUid}` }, { text: '💰 Цена изменена', callback_data: `pricechange_${priceUid}` }],
+        [{ text: '❌ Не доставлен', callback_data: `notdelivered_${priceUid}` }],
+        [{ text: '➕ В маршрут', callback_data: `routeadd_${priceUid}` }]
+      ]};
+      editMessageReplyMarkup(chatId, saved.messageId, kb);
+    }
+    sendMessage(`✅ Сумма ${val} BYN сохранена. Теперь нажмите «Доставлено» в карточке заказа.`, 
+      null, chatId, CONFIG.SEND_MODE.FAST, null, { markdown: false });
+    return true;
+  }
+
+  // 4. ШАГИ ДАТЬ ДЕНЕГ (ОСНОВНЫЕ)
+  if (getWithTTL(`gm_step_${chatId}`) === 'ask_sum') {
+    const val = parsePrice(text);
+    setWithTTL(`gm_sum_${chatId}`, val, 30); setWithTTL(`gm_step_${chatId}`, 'choose', 30);
+    const kb = { inline_keyboard: [] };
+    CONFIG.SUPPLIERS.GIVE_MONEY.forEach((s, i) => {
+      if (i % 2 === 0) kb.inline_keyboard.push([{ text: s, callback_data: `gm_supplier_${s}` }]);
+      else kb.inline_keyboard[kb.inline_keyboard.length-1].push({ text: s, callback_data: `gm_supplier_${s}` });
+    });
+    sendMessage(`Кому дал ${val}?`, kb, chatId); return true;
+  }
+
+  // 5. ШАГИ ОБМЕНА ВАЛЮТЫ
+  const buyStep = getWithTTL(`buyusd_step_${chatId}`);
+  if (buyStep === 'ask_byn') { 
+    const val = parsePrice(text);
+    setWithTTL(`buyusd_byn_${chatId}`, val, 30); 
+    setWithTTL(`buyusd_step_${chatId}`, 'ask_usd', 30); 
+    sendMessage('Сколько получил USD?', null, chatId); 
+    return true; 
+  }
+  if (buyStep === 'ask_usd') {
+    const val = parsePrice(text);
+    const byn = getWithTTL(`buyusd_byn_${chatId}`);
+    writeReport(-byn, val, 'Купил баксы', `Курс ${(byn/val).toFixed(4)}`, userName); // 🔥 ДОБАВЛЕНО userName
+    scriptProps.deleteProperty(`buyusd_step_${chatId}`); 
+    scriptProps.deleteProperty(`buyusd_byn_${chatId}`); 
+    sendMessage('💵 Записано', null, chatId); 
+    return true;
+  }
+
+    // ===== ДАТЬ ДЕНЕГ → ДРУГОЕ =====
+  if (getWithTTL(`gm_step_${chatId}`) === 'ask_other_name') {
+    const target = text.trim();
+    const sum = Number(getWithTTL(`gm_sum_${chatId}`));
+
+    if (!target) {
+      sendMessage('❌ Введите, кому именно вы дали деньги', null, chatId);
+      return true;
+    }
+
+    writeReport(
+      -sum,
+      '',
+      'Дать денег',
+      target,
+      userName
+    );
+
+    sendMessage(
+      `✅ Записано:\nДал ${sum} BYN → ${target}`,
+      null,
+      chatId,
+      CONFIG.SEND_MODE.FAST,
+      null,
+      { markdown: false }
+    );
+
+    clearStates(chatId);
+    return true;
+  }
+
+  return false;
+}
+
+// ===================== СИСТЕМНЫЕ ФУНКЦИИ =====================
+// 🔥 ОБНОВЛЕННЫЙ writeReport С ИМЕНЕМ ПОЛЬЗОВАТЕЛЯ И ДИНАМИЧЕСКИМИ КОЛОНКАМИ
+function writeReport(byn, usd, art, purp, userName = 'Система') {
+  try {
+    const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    const sheet = ss.getSheetByName(CONFIG.SHEETS.REPORTS);
+    if (!sheet) return;
+    
+    const rawHeaders = sheet.getRange(4, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const headers = rawHeaders.map(h => String(h).replace(/\s+/g, ' ').trim().toLowerCase());
+    
+    const rowData = new Array(rawHeaders.length).fill('');
+    
+    // Ищем индексы (теперь более гибко)
+    const idxDate = headers.findIndex(h => h.includes('дата'));
+    const idxByn = headers.findIndex(h => h.includes('byn') || h.includes('сумма'));
+    const idxUsd = headers.findIndex(h => h.includes('usd') || h.includes('доллар'));
+    const idxArt = headers.findIndex(h => h.includes('статья'));
+    const idxPurp = headers.findIndex(h => h.includes('платежа'));
+    const idxWho = headers.findIndex(h => h.includes('кто') || h.includes('выполнил') || h.includes('исполнитель'));
+
+    if (idxDate !== -1) rowData[idxDate] = getToday();
+    if (idxByn !== -1) rowData[idxByn] =  byn === '' ? '' : byn;
+    if (idxUsd !== -1) rowData[idxUsd] =  usd === '' ? '' : usd;
+    if (idxArt !== -1) rowData[idxArt] = art;
+    if (idxPurp !== -1) rowData[idxPurp] = String(purp || '');
+    if (idxWho !== -1) rowData[idxWho] = userName;
+    
+    sheet.appendRow(rowData);
+    
+  } catch (error) {
+    console.error('Ошибка записи отчета:', error);
+  }
+}
+
+// 🔥 БЕЗОПАСНАЯ ФУНКЦИЯ ДЛЯ ПОИСКА КОЛОНКИ СТАТУСА
+function getStatusColumnIndex(sheet) {
+  try {
+    const headers = sheet.getRange(2, 1, 1, sheet.getLastColumn()).getValues()[0];
+    
+    // 🔥 Ищем колонку "Статус" с разными вариантами написания
+    for (let i = 0; i < headers.length; i++) {
+      const header = String(headers[i]).trim().toLowerCase();
+      if (header.includes('статус') || header.includes('status')) {
+        return i + 1; // Google Sheets считает с 1
+      }
+    }
+    
+    // 🔥 Если не нашли - выбрасываем ошибку, НЕ используем fallback!
+    throw new Error('❌ Критическая ошибка: Колонка "Статус" не найдена в таблице "Заказы"!');
+    
+  } catch (error) {
+    console.error('Ошибка в getStatusColumnIndex:', error);
+    throw error;
+  }
+}
+
+// 🔥 ОПТИМИЗИРОВАННЫЙ updateOrderStatus С ПАКЕТНЫМ ОБНОВЛЕНИЕМ
+function updateOrderStatus(rows, status) {
+  try {
+    const sheet = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID)
+      .getSheetByName(CONFIG.SHEETS.ORDERS);
+    
+    if (!sheet) {
+      console.error('❌ Таблица "Заказы" не найдена');
+      return;
+    }
+    
+    // 🔥 Находим колонку статуса
+    const statusColumnIndex = getStatusColumnIndex(sheet);
+    console.log(`📍 Колонка статуса: ${statusColumnIndex}`);
+    
+    // 🔥 Группируем строки для пакетного обновления
+    const rowGroups = {};
+    const deletedRows = [];
+    const updatedRows = [];
+    
+    // Фильтруем валидные строки
+    rows.forEach(row => {
+      if (row <= 2) return; // Пропускаем заголовки
+      
+      try {
+        // Проверяем, что строка существует и не пустая
+        const orderNumCell = sheet.getRange(row, 1);
+        if (orderNumCell.isBlank()) {
+          deletedRows.push(row);
+          return;
+        }
+        
+        const statusCell = sheet.getRange(row, statusColumnIndex);
+        const currentStatus = statusCell.getValue();
+        
+        // Обновляем только если статус изменился
+        if (String(currentStatus) !== String(status)) {
+          updatedRows.push(row);
+          
+          // Группируем по диапазонам для batch update
+          if (!rowGroups[statusColumnIndex]) {
+            rowGroups[statusColumnIndex] = [];
+          }
+          rowGroups[statusColumnIndex].push([row, status]);
+        }
+      } catch (error) {
+        console.error(`❌ Ошибка проверки строки ${row}:`, error.message);
+        deletedRows.push(row);
+      }
+    });
+    
+    // 🔥 ПАКЕТНОЕ ОБНОВЛЕНИЕ (по колонкам)
+    for (const [col, updates] of Object.entries(rowGroups)) {
+      if (updates.length === 0) continue;
+      
+      // Сортируем по возрастанию строк
+      updates.sort((a, b) => a[0] - b[0]);
+      
+      // 🔥 Объединяем смежные строки в диапазоны
+      let startRow = updates[0][0];
+      let endRow = startRow;
+      let currentStatus = updates[0][1];
+      
+      for (let i = 1; i <= updates.length; i++) {
+        if (i < updates.length && 
+            updates[i][0] === endRow + 1 && 
+            updates[i][1] === currentStatus) {
+          // Смежные строки с одинаковым статусом
+          endRow = updates[i][0];
+        } else {
+          // Конец диапазона - обновляем пакетно
+          const range = sheet.getRange(startRow, Number(col), endRow - startRow + 1, 1);
+          const statusArray = new Array(endRow - startRow + 1).fill([currentStatus]);
+          range.setValues(statusArray);
+          
+          console.log(`✅ Обновлен диапазон строк ${startRow}-${endRow}: ${currentStatus}`);
+          
+          if (i < updates.length) {
+            startRow = updates[i][0];
+            endRow = startRow;
+            currentStatus = updates[i][1];
+          }
+        }
+      }
+    }
+    
+    // 🔥 Логирование результатов
+    console.log(`📊 Итог обновления статусов:
+    • Всего строк: ${rows.length}
+    • Обновлено: ${updatedRows.length}
+    • Удалено/не найдено: ${deletedRows.length}`);
+    
+    // 🔥 Уведомление если были проблемы
+    if (deletedRows.length > 0 && CONFIG.DEBUG) {
+      const msg = `⚠️ Внимание: ${deletedRows.length} строк не найдены в таблице`;
+      sendMessage(msg, null, CONFIG.CHAT_ID, CONFIG.SEND_MODE.QUEUE, null, { markdown: false });
+    }
+    
+    return { 
+      updated: updatedRows.length, 
+      deleted: deletedRows.length,
+      updatedRows: updatedRows,
+      deletedRows: deletedRows
+    };
+    
+  } catch (error) {
+    console.error('❌ Критическая ошибка в updateOrderStatus:', error);
+    
+    const errorMsg = `🚨 Ошибка обновления статусов\nПроблема: ${error.message}`;
+    sendMessage(errorMsg, null, CONFIG.CHAT_ID, CONFIG.SEND_MODE.FAST, null, { markdown: false });
+    
+    throw error;
+  }
+}
+
+// 🔥 ОБНОВЛЕННАЯ updateStatusByOrderNum С ДИНАМИЧЕСКОЙ КОЛОНКОЙ СТАТУСА
+function updateStatusByOrderNum(num, status) {
+  try {
+    const sheet = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID).getSheetByName(CONFIG.SHEETS.ORDERS);
+    if (!sheet) {
+      console.error('❌ Таблица "Заказы" не найдена');
+      return;
+    }
+    
+    // 🔥 Используем ту же функцию для поиска колонки статуса
+    const statusColumnIndex = getStatusColumnIndex(sheet);
+    console.log(`📍 updateStatusByOrderNum: колонка статуса = ${statusColumnIndex}`);
+    
+    const lastRow = sheet.getLastRow();
+    if (lastRow < 3) return;
+    
+    // 🔥 Используем динамический поиск колонки ORDER_NUM
+    const cols = initColumns();
+    const orderNumColIdx = cols.ORDER_NUM + 1; 
+    
+    const range = sheet.getRange(1, orderNumColIdx, lastRow, 1);
+    const cells = range.createTextFinder(String(num).trim()).matchEntireCell(true).findAll();
+    
+    if (cells.length === 0) {
+      console.log(`ℹ️ Номер заказа "${num}" не найден в таблице`);
+      return;
+    }
+    
+    let updatedCount = 0;
+    cells.forEach(c => {
+      const row = c.getRow();
+      
+      // 🔥 Пропускаем заголовки и удаленные строки
+      if (row <= 2) return;
+      
+      const statusCell = sheet.getRange(row, statusColumnIndex);
+      const currentStatus = statusCell.getValue();
+      
+      // 🔥 Проверяем, что строка не удалена
+      if (statusCell.isBlank() && currentStatus === '' && sheet.getRange(row, orderNumColIdx).isBlank()) {
+        console.warn(`⚠️ Строка ${row} возможно удалена (пустые данные)`);
+        return;
+      }
+      
+      // 🔥 Обновляем только если статус изменился
+      if (String(currentStatus) !== String(status)) {
+        statusCell.setValue(status);
+        updatedCount++;
+        console.log(`✅ Обновлен статус заказа ${num} в строке ${row}: ${currentStatus} → ${status}`);
+      }
+    });
+    
+    console.log(`📊 Обновлено статусов для заказа ${num}: ${updatedCount} строк`);
+    
+  } catch (error) {
+    console.error('Ошибка в updateStatusByOrderNum:', error);
+    
+    // 🔥 Отправляем уведомление об ошибке
+    if (CONFIG.DEBUG) {
+      const errorMsg = `❌ Ошибка обновления статуса заказа ${num}:\n${error.message}`;
+      sendMessage(errorMsg, null, CONFIG.CHAT_ID, CONFIG.SEND_MODE.FAST);
+    }
+  }
+}
+
+function getUsdRateCached() {
+  const cached = getWithTTL('usd_rate'); if (cached) return cached;
+  try {
+    const html = UrlFetchApp.fetch('https://myfin.by/currency/minsk').getContentText();
+    const match = html.match(/НБРБ.*?accent.*?([\d.,]+)/);
+    const rate = match ? Number(match[1].replace(',', '.')) : 1;
+    setWithTTL('usd_rate', rate, 720); return rate;
+  } catch(e) { return 1; }
+}
+
+function buildRoute(chatId) {
+  const key = `route_${CONFIG.CHAT_ID}`;
+  const addresses = getWithTTL(key);
+  
+  if (!addresses || !addresses.length) {
+    return sendMessage('📭 *Маршрут пуст*\\. Добавьте адреса кнопкой «➕ В маршрут»', null, chatId);
+  }
+  
+  sendMessage('🔄 _Строю маршрут, подождите..._', null, chatId);
+  
+  const coords = addresses.map(addr => {
+    try {
+      const url = `https://geocode-maps.yandex.ru/1.x/?format=json&apikey=${CONFIG.YANDEX_API_KEY}&geocode=${encodeURIComponent(cleanAddress(addr))}`;
+      const resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+      const res = JSON.parse(resp.getContentText());
+      const pos = res.response?.GeoObjectCollection?.featureMember[0]?.GeoObject?.Point?.pos;
+      return pos ? pos.split(' ').reverse().join(',') : null;
+    } catch(e) { 
+      logDebug('Geocode error for ' + addr + ': ' + e.message);
+      return null; 
+    }
+  }).filter(c => c);
+  
+  if (!coords.length) {
+    return sendMessage('❌ Не удалось найти координаты для адресов в списке', null, chatId);
+  }
+  
+  const routeUrl = `https://yandex.ru/maps/?rtext=~${coords.join('~')}&rtt=auto`;
+  const count = addresses.length;
+  const text = mdSafe(`🚗 Маршрут построен (${count} точек)`);
+  
+  const kb = { 
+    inline_keyboard: [
+      [{ text: '🗺️ Открыть Яндекс Карты', url: routeUrl }],
+      [{ text: '🗑️ Очистить маршрут', callback_data: 'clear_route_confirm' }] 
+    ]
+  };
+  
+  sendMessage(text, kb, chatId);
+}
+
+function handleVamPhoto(msg) {
+  const chatId = msg.chat.id;
+  const step = getWithTTL(`vam_step_${chatId}`);
+
+  if (step !== 'vam_wait_photo') {
+    sendMessage('⚠️ Фото уже получено. Введите сумму.', null, chatId);
+    return;
+  }
+  const fileId = msg.photo[msg.photo.length - 1].file_id;
+  const res = JSON.parse(UrlFetchApp.fetch(`https://api.telegram.org/bot${CONFIG.TOKEN}/getFile?file_id=${fileId}`));
+  const blob = UrlFetchApp.fetch(`https://api.telegram.org/file/bot${CONFIG.TOKEN}/${res.result.file_path}`).getBlob();
+  const file = DriveApp.getFolderById(CONFIG.OCR_FOLDER_ID).createFile(blob);
+  const result = processVamExpressOCR(file);
+  setWithTTL(`vam_step_${chatId}`, 'vam_wait_sum', 30);
+  sendMessage(`🧾 OCR обработан: найдено строк — ${result.count}\n\n💰 Введите фактически полученную сумму`, 
+  null, chatId, CONFIG.SEND_MODE.FAST, null, { markdown: false });
+}
+
+function clearStates(chatId, uid = null) {
+  const keys = [ 
+    `gm_step_${chatId}`, 
+    `gm_sum_${chatId}`, 
+    `buyusd_step_${chatId}`, 
+    `vam_step_${chatId}`, 
+    `price_step_${chatId}`,
+    `extra_edit_sum_${chatId}`
+  ];
+  keys.forEach(k => scriptProps.deleteProperty(k));
+  
+  if (uid) {
+    scriptProps.deleteProperty(uid);
+    scriptProps.deleteProperty(`ttl_${uid}`); // 🔥 ДОБАВЛЕНО
+  }
+}
+
+function ensureQueueTrigger() { 
+  if (!ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === 'processQueueFast')) { 
+    ScriptApp.newTrigger('processQueueFast').timeBased().everyMinutes(1).create(); 
+  } 
+}
+
+// 🔥 ОБНОВЛЕННАЯ ФУНКЦИЯ БАЛАНСА С ДИНАМИЧЕСКИМ ПОИСКОМ
+function sendMoneyBalance(chatId) {
+  try {
+    const sheet = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID)
+      .getSheetByName(CONFIG.SHEETS.REPORTS);
+    
+    if (!sheet) {
+      sendMessage('❌ Лист "Отчёты" не найден', null, chatId);
+      return;
+    }
+    
+    // 🔥 ПРЯМОЕ ЧТЕНИЕ ИЗ КОНКРЕТНЫХ ЯЧЕЕК (G1 и H1)
+    let byn = '', usd = '';
+    
+    try {
+      // BYN находится в ячейке G1 (столбец 7, строка 1)
+      byn = sheet.getRange('G1').getValue();
+    } catch (e) {
+      console.warn('Не удалось прочитать BYN из G1:', e.message);
+    }
+    
+    try {
+      // USD находится в ячейке H1 (столбец 8, строка 1)
+      usd = sheet.getRange('H1').getValue();
+    } catch (e) {
+      console.warn('Не удалось прочитать USD из H1:', e.message);
+    }
+    
+    // 🔥 ФОРМАТИРУЕМ ДЛЯ ОТОБРАЖЕНИЯ (два знака после запятой)
+    const formattedByn = formatPriceForDisplay(byn);
+    const formattedUsd = formatPriceForDisplay(usd);
+    
+    // 🔥 ЭКРАНИРУЕМ ДЛЯ MARKDOWN
+    const safeByn = mdSafe(formattedByn);
+    const safeUsd = mdSafe(formattedUsd);
+    
+    // 🔥 ФОРМАТИРОВАННЫЙ ОТВЕТ
+    const message = `📊 *Баланс*\n` +
+                   `Должно быть: ${safeByn} руб\n` +
+                   `Доллары: ${safeUsd} USD`;
+    
+    sendMessage(
+      message,
+      null,
+      chatId,
+      CONFIG.SEND_MODE.FAST,
+      null,
+      { markdown: true }
+    );
+    
+    console.log(`✅ Баланс отправлен: BYN=${formattedByn}, USD=${formattedUsd}`);
+    
+  } catch (error) {
+    console.error('❌ Ошибка в sendMoneyBalance:', error);
+    sendMessage(
+      `❌ Ошибка получения баланса:\n${error.message}`,
+      null,
+      chatId,
+      CONFIG.SEND_MODE.FAST,
+      null,
+      { markdown: false }
+    );
+  }
+}
+
+function editMessageText(chatId, messageId, text, useMarkdown = true) { 
+  try {
+    const payload = {
+      chat_id: chatId, 
+      message_id: messageId, 
+      text: text
+    };
+    
+    if (useMarkdown) {
+      payload.parse_mode = 'MarkdownV2';
+    }
+    
+    UrlFetchApp.fetch(`https://api.telegram.org/bot${CONFIG.TOKEN}/editMessageText`, { 
+      method: 'post', 
+      contentType: 'application/json', 
+      payload: JSON.stringify(payload), 
+      muteHttpExceptions: true 
+    });
+  } catch(e) {
+    logDebug('editMessageText error: ' + e.message);
+  }
+}
+
+function editMessageReplyMarkup(chatId, messageId, keyboard) { 
+  try {
+    UrlFetchApp.fetch(`https://api.telegram.org/bot${CONFIG.TOKEN}/editMessageReplyMarkup`, { 
+      method: 'post', 
+      contentType: 'application/json', 
+      payload: JSON.stringify({ 
+        chat_id: chatId, 
+        message_id: messageId, 
+        reply_markup: keyboard 
+      }), 
+      muteHttpExceptions: true 
+    }); 
+  } catch(e) {
+    logDebug('editMessageReplyMarkup error: ' + e.message);
+  }
+}
+
+function answerCb(id, text) { 
+  UrlFetchApp.fetch(`https://api.telegram.org/bot${CONFIG.TOKEN}/answerCallbackQuery`, { 
+    method: 'post', 
+    contentType: 'application/json', 
+    payload: JSON.stringify({ callback_query_id: id, text: text }) 
+  }); 
+}
+
+function logDebug(msg) {
+  const cleanMsg = String(msg || '');
+  console.log(cleanMsg);
+  
+  // 🔥 ЗАЩИТА: не отправляем в Telegram если содержит ошибки парсинга Markdown
+  if (cleanMsg.includes('Bad Request') || 
+      cleanMsg.includes('parse_mode') || 
+      cleanMsg.includes('markdown')) {
+    return;
+  }
+  
+  // 🔥 ЛИМИТ: отправляем только 30% сообщений в DEBUG режиме
+  if (CONFIG.DEBUG && !cleanMsg.includes('LOG:') && Math.random() < 0.3) {
+    try {
+      UrlFetchApp.fetch(`https://api.telegram.org/bot${CONFIG.TOKEN}/sendMessage`, { 
+        method: 'post', 
+        contentType: 'application/json', 
+        payload: JSON.stringify({ 
+          chat_id: CONFIG.CHAT_ID, 
+          text: `LOG: ${cleanMsg.slice(0, 1000)}`,
+          parse_mode: null,
+          disable_web_page_preview: true
+        }),
+        muteHttpExceptions: true
+      });
+    } catch(e) {
+      // Молчим об ошибках отправки логов
+    }
+  }
+}
+
+// 🔥 ФУНКЦИЯ ДЛЯ ПРОВЕРКИ СОСТОЯНИЯ БОТА
+function botHealthCheck() {
+  const checks = [];
+  
+  // 1. Проверка доступа к таблице
+  try {
+    const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    checks.push({ name: 'Таблица', status: '✅' });
+  } catch (e) {
+    checks.push({ name: 'Таблица', status: '❌', error: e.message });
+  }
+  
+  // 2. Проверка колонок
+  try {
+    initColumns();
+    checks.push({ name: 'Колонки', status: '✅', info: Object.keys(COL_IDX).length + ' колонок' });
+  } catch (e) {
+    checks.push({ name: 'Колонки', status: '❌', error: e.message });
+  }
+  
+  // 3. Проверка Telegram API
+  try {
+    const resp = UrlFetchApp.fetch(`https://api.telegram.org/bot${CONFIG.TOKEN}/getMe`, {
+      muteHttpExceptions: true
+    });
+    const data = JSON.parse(resp.getContentText());
+    checks.push({ name: 'Telegram API', status: data.ok ? '✅' : '❌', info: data.ok ? 'Бот доступен' : data.description });
+  } catch (e) {
+    checks.push({ name: 'Telegram API', status: '❌', error: e.message });
+  }
+  
+  // 4. Проверка папки OCR
+  try {
+    const folder = DriveApp.getFolderById(CONFIG.OCR_FOLDER_ID);
+    checks.push({ name: 'Папка OCR', status: '✅', info: folder.getName() });
+  } catch (e) {
+    checks.push({ name: 'Папка OCR', status: '❌', error: e.message });
+  }
+  
+  // 🔥 5. Проверка листа ТБ (НОВОЕ)
+  try {
+    const sheet = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID)
+      .getSheetByName(CONFIG.SHEETS.TB);
+    if (sheet) {
+      const lastRow = sheet.getLastRow();
+      const rowCount = Math.max(0, lastRow - 1); // вычитаем заголовок
+      checks.push({ 
+        name: 'Лист ТБ', 
+        status: '✅', 
+        info: `название: "${sheet.getName()}", строк: ${rowCount}` 
+      });
+    } else {
+      checks.push({ 
+        name: 'Лист ТБ', 
+        status: '⚠️', 
+        error: 'Лист не найден, но это может быть нормально (запись будет пропущена)' 
+      });
+    }
+  } catch (e) {
+    checks.push({ name: 'Лист ТБ', status: '❌', error: e.message });
+  }
+  
+  // 6. Проверка данных поставщиков (кеширование)
+  try {
+    const suppliersData = getSuppliersData();
+    const suppliersCount = Object.keys(suppliersData.supInfo).length;
+    checks.push({ 
+      name: 'Справочник поставщиков', 
+      status: '✅', 
+      info: `${suppliersCount} поставщиков (кешировано)` 
+    });
+  } catch (e) {
+    checks.push({ name: 'Справочник поставщиков', status: '❌', error: e.message });
+  }
+  
+  // Формируем отчет
+  const failed = checks.filter(c => c.status === '❌');
+  const warnings = checks.filter(c => c.status === '⚠️');
+  const report = checks.map(c => 
+    `${c.status} ${c.name}` + (c.info ? ` (${c.info})` : '') + (c.error ? `: ${c.error}` : '')
+  ).join('\n');
+  
+  // 🔥 Отправляем отчет если есть ошибки или в режиме DEBUG
+  if (failed.length > 0 || CONFIG.DEBUG) {
+    const statusEmoji = failed.length > 0 ? '❌' : (warnings.length > 0 ? '⚠️' : '✅');
+    sendMessage(`🔍 *Проверка здоровья бота* ${statusEmoji}\n\n${report}`, 
+               null, CONFIG.CHAT_ID, CONFIG.SEND_MODE.FAST);
+  }
+  
+  return { 
+    checks, 
+    allOk: failed.length === 0,
+    hasWarnings: warnings.length > 0
+  };
+}
+
+// 🔥 ФУНКЦИЯ ДЛЯ ПРОВЕРКИ ИСПОЛЬЗОВАНИЯ ПАМЯТИ
+function checkMemoryUsage() {
+  const props = scriptProps.getProperties();
+  const propsSize = JSON.stringify(props).length;
+  const propsCount = Object.keys(props).length;
+  
+  console.log(`📊 Использование памяти ScriptProperties:`);
+  console.log(`   • Ключей: ${propsCount}`);
+  console.log(`   • Размер: ${(propsSize / 1024).toFixed(2)} KB`);
+  console.log(`   • Лимит: ~500 KB`);
+  console.log(`   • Использовано: ${((propsSize / 500000) * 100).toFixed(1)}%`);
+  
+  // Уведомление если превышаем 70%
+  if (propsSize > 350000 && CONFIG.DEBUG) {
+    sendMessage(
+      `⚠️ *ВНИМАНИЕ: ScriptProperties на ${((propsSize / 500000) * 100).toFixed(1)}%*\n` +
+      `Ключей: ${propsCount}\n` +
+      `Рекомендуется запустить очистку в меню Бота → Очистить старые свойства`,
+      null, CONFIG.CHAT_ID, CONFIG.SEND_MODE.FAST
+    );
+  }
+  
+  return { size: propsSize, count: propsCount, percent: (propsSize / 500000) * 100 };
+}
+
+// 🔥 НОВАЯ ФУНКЦИЯ ДЛЯ ПРОВЕРКИ КОЛОНКИ СТАТУСА
+function checkStatusColumn() {
+  try {
+    const sheet = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID)
+      .getSheetByName(CONFIG.SHEETS.ORDERS);
+    
+    const colIndex = getStatusColumnIndex(sheet);
+    const headers = sheet.getRange(2, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const statusHeader = headers[colIndex - 1];
+    
+    const ui = SpreadsheetApp.getUi();
+    ui.alert(
+      '✅ Колонка статуса найдена',
+      `Колонка: ${colIndex}\nЗаголовок: "${statusHeader}"\nВсе заголовки:\n${headers.map((h,i) => `${i+1}: "${h}"`).join('\n')}`,
+      ui.ButtonSet.OK
+    );
+    
+  } catch (error) {
+    const ui = SpreadsheetApp.getUi();
+    ui.alert(
+      '❌ Ошибка поиска колонки статуса',
+      error.message,
+      ui.ButtonSet.OK
+    );
+  }
+}
+
+function checkSheetStructure() {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  let report = "🔍 **ОТЧЕТ ПО ПРОВЕРКЕ КОЛОНОК**\n\n";
+
+  // 1. ПРОВЕРКА ЛИСТА "Заказы"
+  const orderSheet = ss.getSheetByName(CONFIG.SHEETS.ORDERS);
+  if (!orderSheet) {
+    report += "❌ Лист 'Заказы' НЕ НАЙДЕН\n";
+  } else {
+    report += "--- ЛИСТ 'ЗАКАЗЫ' (Заголовки во 2-й строке) ---\n";
+    const headers = orderSheet.getRange(2, 1, 1, orderSheet.getLastColumn()).getValues()[0]
+      .map(h => String(h).trim());
+    
+    for (const [key, expectedName] of Object.entries(CONFIG.COLUMN_NAMES)) {
+      const idx = headers.indexOf(expectedName);
+      if (idx !== -1) {
+        report += `✅ ${expectedName} (Колонка ${idx + 1})\n`;
+      } else {
+        report += `❌ НЕ НАЙДЕНА: "${expectedName}"\n`;
+      }
+    }
+  }
+
+  report += "\n";
+
+  // 2. ПРОВЕРКА ЛИСТА "Отчёты"
+  const reportSheet = ss.getSheetByName(CONFIG.SHEETS.REPORTS);
+  if (!reportSheet) {
+    report += "❌ Лист 'Отчёты' НЕ НАЙДЕН\n";
+  } else {
+    report += "--- ЛИСТ 'ОТЧЁТЫ' (Заголовки в 1-й строке) ---\n";
+    const headers = reportSheet.getRange(1, 1, 1, reportSheet.getLastColumn()).getValues()[0]
+      .map(h => String(h).trim());
+    
+    // Список того, что ищет функция writeReport
+    const required = ['Дата', 'BYN', 'USD', 'Статья', 'Назначение платежа', 'Кто выполнил'];
+    
+    required.forEach(name => {
+      const idx = headers.findIndex(h => h.toLowerCase().includes(name.toLowerCase()));
+      if (idx !== -1) {
+        report += `✅ ${name} (найдена как "${headers[idx]}", №${idx + 1})\n`;
+      } else {
+        report += `❌ КРИТИЧНО: Колонка для "${name}" не опознана\n`;
+      }
+    });
+  }
+
+  // ВЫВОД РЕЗУЛЬТАТА
+  const ui = SpreadsheetApp.getUi();
+  const html = HtmlService.createHtmlOutput('<pre style="font-family: sans-serif;">' + report + '</pre>')
+    .setWidth(500)
+    .setHeight(600);
+  ui.showModelessDialog(html, "Результат проверки структуры");
+  
+  // Дополнительно дублируем в консоль
+  console.log(report);
+}
