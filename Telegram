@@ -861,16 +861,16 @@ function setWithTTL(key, value, min, useCache = false) {
 function getWithTTL(key) {
   // 1. Проверяем TTL в ScriptProperties (главный источник истины)
   const ttl = scriptProps.getProperty(`ttl_${key}`);
+  const val = scriptProps.getProperty(key);
 
-  // Если TTL истек или нет - удаляем ВСЕ следы и возвращаем null
+  // Если TTL истек - удаляем ВСЕ следы и возвращаем null
   if (ttl && Date.now() > Number(ttl)) {
     scriptProps.deleteProperty(key);
     scriptProps.deleteProperty(`ttl_${key}`);
 
-    // Удаляем из CacheService тоже
     try {
       CACHE.remove(`cache_${key}`);
-      CACHE.remove(key); // На всякий случай
+      CACHE.remove(key);
     } catch (e) {
       // Игнорируем ошибки CacheService
     }
@@ -878,18 +878,23 @@ function getWithTTL(key) {
     return null;
   }
 
+  // Если TTL/данные в Properties уже удалены, не даем CacheService вернуть устаревшее значение
+  if (!ttl && !val) {
+    try {
+      CACHE.remove(`cache_${key}`);
+      CACHE.remove(key);
+    } catch (e) {
+      // Игнорируем ошибки CacheService
+    }
+    return null;
+  }
+
   // 2. Пробуем CacheService, но только если TTL актуален
   try {
-    // Пробуем два возможных ключа кэша
     const cacheKeys = [`cache_${key}`, key];
     for (const cacheKey of cacheKeys) {
       const cached = CACHE.get(cacheKey);
       if (cached) {
-        // Дополнительная проверка: если есть TTL в Properties, проверяем его
-        if (ttl && Date.now() > Number(ttl)) {
-          CACHE.remove(cacheKey);
-          return null;
-        }
         return JSON.parse(cached);
       }
     }
@@ -897,8 +902,7 @@ function getWithTTL(key) {
     // Игнорируем ошибки CacheService
   }
 
-  // 3. Fallback на ScriptProperties (если TTL актуален или его нет)
-  const val = scriptProps.getProperty(key);
+  // 3. Fallback на ScriptProperties
   return val ? JSON.parse(val) : null;
 }
 
@@ -2452,35 +2456,39 @@ function updateOrderStatus(rows, status) {
       return;
     }
 
-    // 🔥 Находим колонку статуса
     const statusColumnIndex = getStatusColumnIndex(sheet);
+    const cols = initColumns();
+    const orderNumColumnIndex = cols.ORDER_NUM + 1;
     console.log(`📍 Колонка статуса: ${statusColumnIndex}`);
 
-    // 🔥 Группируем строки для пакетного обновления
+    const validRows = [...new Set(rows.filter(row => row > 2))].sort((a, b) => a - b);
+    if (!validRows.length) {
+      return { updated: 0, deleted: 0, updatedRows: [], deletedRows: [] };
+    }
+
+    const minRow = validRows[0];
+    const maxRow = validRows[validRows.length - 1];
+    const rowCount = maxRow - minRow + 1;
+    const orderValues = sheet.getRange(minRow, orderNumColumnIndex, rowCount, 1).getValues();
+    const statusValues = sheet.getRange(minRow, statusColumnIndex, rowCount, 1).getValues();
+
     const rowGroups = {};
     const deletedRows = [];
     const updatedRows = [];
 
-    // Фильтруем валидные строки
-    rows.forEach(row => {
-      if (row <= 2) return; // Пропускаем заголовки
-
+    validRows.forEach(row => {
       try {
-        // Проверяем, что строка существует и не пустая
-        const orderNumCell = sheet.getRange(row, 1);
-        if (orderNumCell.isBlank()) {
+        const offset = row - minRow;
+        const orderNumber = orderValues[offset]?.[0];
+        const currentStatus = statusValues[offset]?.[0];
+
+        if (orderNumber === '' || orderNumber === null || orderNumber === undefined) {
           deletedRows.push(row);
           return;
         }
 
-        const statusCell = sheet.getRange(row, statusColumnIndex);
-        const currentStatus = statusCell.getValue();
-
-        // Обновляем только если статус изменился
         if (String(currentStatus) !== String(status)) {
           updatedRows.push(row);
-
-          // Группируем по диапазонам для batch update
           if (!rowGroups[statusColumnIndex]) {
             rowGroups[statusColumnIndex] = [];
           }
