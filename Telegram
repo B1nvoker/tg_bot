@@ -1066,6 +1066,27 @@ function notifyTodayOrdersToPersonal(rows) {
   sendMessage(text, null, CONFIG.CHAT_ID_PERSONAL, CONFIG.SEND_MODE.FAST, null, { markdown: false });
 }
 
+function collectSuppliersFromRows(rows) {
+  const supplierGroups = {};
+
+  rows.forEach(({ row }) => {
+    const supName = String(row[COL_IDX.SUPPLIER] || '').trim();
+    if (!supName) return;
+
+    const supNorm = normalizeSupplierName(supName);
+    if (!supplierGroups[supNorm]) {
+      supplierGroups[supNorm] = {
+        name: supName,
+        items: []
+      };
+    }
+
+    supplierGroups[supNorm].items.push({ model: row[COL_IDX.MODEL] });
+  });
+
+  return supplierGroups;
+}
+
 function cleanAddress(addr) {
   return String(addr || '').replace(/\(.*?\)/g, '').replace(/\s+/g, ' ').replace(/[,;]+/g, ',').trim();
 }
@@ -1275,7 +1296,7 @@ function sendOrdersToTelegram() {
     notifyTodayOrdersToPersonal(rows);
 
     // 2. ✅ Поставщики — ВСЕ за сегодня
-    const supplierSums = collectSuppliersForToday();
+    const supplierSums = collectSuppliersFromRows(rows);
 
     // 3. ✅ Доп-дела — ВСЕ за сегодня
     const extraBySupplier = collectExtraTasksBySupplier();
@@ -1298,7 +1319,6 @@ function sendOrdersToTelegram() {
 
     // 🔥 ОБРАБОТКА СЕГОДНЯШНИХ ЗАКАЗОВ
     const groups = { vam: {}, auto: {}, normal: {} };
-    const today = getToday();
 
     rows.forEach(({ row, rowIndex }) => {
       // 🔥 ИСПОЛЬЗУЕМ ДИНАМИЧЕСКИЕ ИНДЕКСЫ
