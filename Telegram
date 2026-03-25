@@ -14,6 +14,22 @@ function getConfigValue(key, fallback = '') {
   return propValue !== null && propValue !== '' ? propValue : fallback;
 }
 
+function getSpreadsheet() {
+  if (CONFIG.SPREADSHEET_ID) {
+    try {
+      return SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    } catch (error) {
+      console.warn(`⚠️ Не удалось открыть таблицу по SPREADSHEET_ID (${CONFIG.SPREADSHEET_ID}), используем активную таблицу: ${error.message}`);
+    }
+  }
+
+  const active = SpreadsheetApp.getActiveSpreadsheet();
+  if (!active) {
+    throw new Error('Не удалось получить таблицу: укажите корректный SPREADSHEET_ID или запустите скрипт из привязанной таблицы.');
+  }
+  return active;
+}
+
 const CONFIG = {
   TOKEN: getConfigValue('TOKEN'),
   CHAT_ID: getConfigValue('CHAT_ID'),
@@ -42,6 +58,7 @@ const CONFIG = {
   // 🔥 ОБНОВЛЕННЫЕ НАЗВАНИЯ СТОЛБЦОВ (согласно вашему списку)
   COLUMN_NAMES: {
     DATE: 'Дата поставки',              // Используем дату доставки для фильтрации "на сегодня"
+    DATE_ORDER: 'Дата отгрузки',
     ORDER_NUM: 'Номер заказа',
     COMMENT: 'Примечания к заказу',
     DELIVERY: 'Способ доставки',
@@ -189,7 +206,7 @@ function initColumns(force = false) {
   }
 
   try {
-    const sheet = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID).getSheetByName(CONFIG.SHEETS.ORDERS);
+    const sheet = getSpreadsheet().getSheetByName(CONFIG.SHEETS.ORDERS);
     if (!sheet) throw new Error(`Не найдена таблица "${CONFIG.SHEETS.ORDERS}"`);
 
     // Берем заголовки со 2-й строки
@@ -1141,9 +1158,7 @@ function buildPrintRowsForToday(baseRows) {
   const rows = baseRows.map(item => item.row);
   if (rows.length % 2 === 0) return rows;
 
-  const ordersSheet = SpreadsheetApp
-    .openById(CONFIG.SPREADSHEET_ID)
-    .getSheetByName(CONFIG.SHEETS.ORDERS);
+  const ordersSheet = getSpreadsheet().getSheetByName(CONFIG.SHEETS.ORDERS);
 
   const nextRowIndex = baseRows[baseRows.length - 1].rowIndex + 1;
   if (nextRowIndex > ordersSheet.getLastRow()) {
@@ -1320,9 +1335,7 @@ function getTodayOrderRows() {
     initColumns();
   }
 
-  const ordersSheet = SpreadsheetApp
-    .openById(CONFIG.SPREADSHEET_ID)
-    .getSheetByName(CONFIG.SHEETS.ORDERS);
+  const ordersSheet = getSpreadsheet().getSheetByName(CONFIG.SHEETS.ORDERS);
 
   if (!ordersSheet) {
     throw new Error('❌ Не найдена таблица "Заказы"');
@@ -1338,7 +1351,9 @@ function getTodayOrderRows() {
 
   data.forEach((row, i) => {
     const realRow = i + 3;
-    const rowDate = normalizeSheetDate(row[COL_IDX.DATE]);
+    const rowDate = normalizeSheetDate(
+      row[COL_IDX.DATE_ORDER] || row[COL_IDX.DATE]
+    );
     if (rowDate !== today) return;
 
     const orderNum = String(row[COL_IDX.ORDER_NUM] || '').trim();
@@ -1422,7 +1437,7 @@ function logTechnoBayForTodayOnce() {
 
     data.forEach((row, i) => {
       // Проверка даты
-      const rowDateStr = normalizeSheetDate(row[COL_IDX.DATE]);
+      const rowDateStr = normalizeSheetDate(row[COL_IDX.DATE_ORDER] || row[COL_IDX.DATE]);
 
       if (rowDateStr !== todayStr) return;
 
@@ -1482,7 +1497,7 @@ function collectSuppliersForToday() {
     const supplierGroups = {};
 
     data.forEach((row, i) => {
-      const rowDateStr = normalizeSheetDate(row[COL_IDX.DATE]);
+      const rowDateStr = normalizeSheetDate(row[COL_IDX.DATE_ORDER] || row[COL_IDX.DATE]);
 
       if (rowDateStr !== todayStr) return;
 
@@ -1609,7 +1624,7 @@ function sendOrdersToTelegram() {
       sendMessage(
         `⚠️ Не удалось сформировать гарантийные талоны/чеки: ${printError.message}`,
         null,
-        CONFIG.CHAT_ID,
+        CONFIG.CHAT_ID_PERSONAL || CONFIG.CHAT_ID,
         CONFIG.SEND_MODE.FAST,
         null,
         { markdown: false }
