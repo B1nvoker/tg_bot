@@ -23,6 +23,11 @@ const CONFIG = {
   SPREADSHEET_ID: getConfigValue('SPREADSHEET_ID'),
   OCR_FOLDER_ID: getConfigValue('OCR_FOLDER_ID'),
   YANDEX_API_KEY: getConfigValue('YANDEX_API_KEY'),
+  ONLINER_PRINT: {
+    TEMPLATE_TUF_ID: getConfigValue('ONLINER_PRINT_TEMPLATE_TUF_ID'),
+    TEMPLATE_INOTE_ID: getConfigValue('ONLINER_PRINT_TEMPLATE_INOTE_ID'),
+    OUTPUT_FOLDER_ID: getConfigValue('ONLINER_PRINT_OUTPUT_FOLDER_ID')
+  },
 
   SHEETS: {
     ORDERS: 'Заказы',
@@ -71,6 +76,16 @@ const CONFIG = {
 // 🔥 ДОБАВИТЬ В НАЧАЛО (после CONFIG)
 const CACHE = CacheService.getScriptCache();
 const ONE_HOUR = 3600; // секунд
+
+const ONLINER_PRINT_COLUMNS = {
+  DATE_DELIVERY: 3,
+  ORDER_NUMBER: 4,
+  SOURCE: 8,
+  MODEL: 11,
+  SALE_PRICE: 19,
+  WARRANTY_BASE: 28,
+  WARRANTY_FULL: 34
+};
 
 // 🔥 ГЛОБАЛЬНЫЕ КОНСТАНТЫ ДЛЯ КЭША
 const CACHE_TTL = {
@@ -990,6 +1005,294 @@ function parsePrice(text) {
   return Number(clean) || 0;
 }
 
+function formatByrAmount(value, separator = ' ') {
+  if (value === null || value === undefined || value === '') return '';
+
+  const amount = typeof value === 'string' ? parsePrice(value) : Number(value);
+  if (isNaN(amount)) return '';
+
+  const [integer, decimal] = Math.abs(amount).toFixed(2).split('.');
+  const sign = amount < 0 ? '-' : '';
+
+  const formattedInteger = integer
+    .split('')
+    .reverse()
+    .join('')
+    .replace(/(\d{3})(?=\d)/g, `$1${separator}`)
+    .split('')
+    .reverse()
+    .join('');
+
+  return `${sign}${formattedInteger},${decimal}`;
+}
+
+function pluralizeMonthsForWarranty(n) {
+  if (n % 10 === 1 && n % 100 !== 11) return 'месяц';
+  if ([2, 3, 4].includes(n % 10) && ![12, 13, 14].includes(n % 100)) return 'месяца';
+  return 'месяцев';
+}
+
+function replaceInDocumentElement(element, replacements) {
+  const elementType = element.getType();
+
+  if (elementType === DocumentApp.ElementType.PARAGRAPH) {
+    const paragraph = element.asParagraph();
+    Object.keys(replacements).forEach(key => {
+      const pattern = key.replace(/[{}]/g, '\\$&');
+      paragraph.replaceText(pattern, String(replacements[key]));
+    });
+    return;
+  }
+
+  if (elementType === DocumentApp.ElementType.TABLE) {
+    const table = element.asTable();
+    for (let row = 0; row < table.getNumRows(); row++) {
+      const tableRow = table.getRow(row);
+      for (let cell = 0; cell < tableRow.getNumCells(); cell++) {
+        const tableCell = tableRow.getCell(cell);
+        for (let i = 0; i < tableCell.getNumChildren(); i++) {
+          const child = tableCell.getChild(i);
+          if (child.getType() === DocumentApp.ElementType.PARAGRAPH) {
+            replaceInDocumentElement(child, replacements);
+          }
+        }
+      }
+    }
+  }
+}
+
+function copyAndProcessTemplate(templateId, folderId, fileName) {
+  const templateFile = DriveApp.getFileById(templateId);
+  const targetFolder = DriveApp.getFolderById(folderId);
+  const copiedFile = templateFile.makeCopy(fileName, targetFolder);
+  const copiedDoc = DocumentApp.openById(copiedFile.getId());
+  return { file: copiedFile, doc: copiedDoc };
+}
+
+function buildWarrantyText(acValue, aiValue) {
+  function buildFromAC(value) {
+    if (isNaN(value) || value <= 0) return null;
+    if (value < 36) {
+      const serviceMonths = 36 - value;
+      return `${value} ${pluralizeMonthsForWarranty(value)} + ${serviceMonths} ${pluralizeMonthsForWarranty(serviceMonths)} сервисного обслуживания`;
+    }
+    return `${value} ${pluralizeMonthsForWarranty(value)}`;
+  }
+
+  function buildFromAI(value) {
+    if (isNaN(value) || value <= 0) return null;
+    const base = 12;
+    const serviceMonths = Math.max(value - base, 0);
+    return serviceMonths > 0
+      ? `${base} ${pluralizeMonthsForWarranty(base)} + ${serviceMonths} ${pluralizeMonthsForWarranty(serviceMonths)} сервисного обслуживания`
+      : `${base} ${pluralizeMonthsForWarranty(base)}`;
+  }
+
+  if (!isNaN(acValue) && acValue > 0) return buildFromAC(acValue);
+  if (!isNaN(aiValue) && aiValue > 0) return buildFromAI(aiValue);
+  return `12 ${pluralizeMonthsForWarranty(12)} + 24 ${pluralizeMonthsForWarranty(24)} сервисного обслуживания`;
+}
+
+function appendTemplateContent(targetBody, templateBody) {
+  for (let i = 0; i < templateBody.getNumChildren(); i++) {
+    const element = templateBody.getChild(i).copy();
+    const elementType = element.getType();
+
+    switch (elementType) {
+      case DocumentApp.ElementType.PARAGRAPH:
+        targetBody.appendParagraph(element.asParagraph());
+        break;
+      case DocumentApp.ElementType.TABLE:
+        targetBody.appendTable(element.asTable());
+        break;
+      case DocumentApp.ElementType.INLINE_IMAGE:
+        targetBody.appendImage(element.asInlineImage());
+        break;
+      case DocumentApp.ElementType.LIST_ITEM:
+        targetBody.appendListItem(element.asListItem());
+        break;
+      default:
+        targetBody.appendParagraph(element.getText ? element.getText() : '');
+    }
+  }
+}
+
+function createChecksSpreadsheetInFolder(folderId, fileName, modelsSummary) {
+  const spreadsheet = SpreadsheetApp.create(fileName);
+  const file = DriveApp.getFileById(spreadsheet.getId());
+  const folder = DriveApp.getFolderById(folderId);
+  file.moveTo(folder);
+
+  const sheet = spreadsheet.getSheets()[0];
+  sheet.setName('Чеки');
+
+  const rows = [['Модель', 'Цена']];
+  modelsSummary
+    .sort((a, b) => a.price - b.price)
+    .forEach(item => rows.push([item.model, item.formattedPrice]));
+
+  sheet.getRange(1, 1, rows.length, 2).setValues(rows);
+  sheet.autoResizeColumns(1, 2);
+
+  return spreadsheet;
+}
+
+function buildPrintRowsForToday(baseRows) {
+  const rows = baseRows.map(item => item.row);
+  if (rows.length % 2 === 0) return rows;
+
+  const ordersSheet = SpreadsheetApp
+    .openById(CONFIG.SPREADSHEET_ID)
+    .getSheetByName(CONFIG.SHEETS.ORDERS);
+
+  const nextRowIndex = baseRows[baseRows.length - 1].rowIndex + 1;
+  if (nextRowIndex > ordersSheet.getLastRow()) {
+    throw new Error('Не удалось добавить следующую строку для четного количества гарантийных талонов');
+  }
+
+  const nextRow = ordersSheet.getRange(nextRowIndex, 1, 1, ordersSheet.getLastColumn()).getValues()[0];
+  rows.push(nextRow);
+  return rows;
+}
+
+function mapRowToCheckSummary(row) {
+  const price = parsePrice(row[ONLINER_PRINT_COLUMNS.SALE_PRICE]);
+  return {
+    model: row[ONLINER_PRINT_COLUMNS.MODEL] || '',
+    price,
+    formattedPrice: formatByrAmount(price, ' ')
+  };
+}
+
+function createPrintDocumentsForBot(baseRows = null, options = {}) {
+  const {
+    sendOrderNumbers = true,
+    notifyUi = false
+  } = options;
+
+  const ui = notifyUi ? SpreadsheetApp.getUi() : null;
+
+  try {
+    if (!CONFIG.CHAT_ID_PERSONAL) {
+      throw new Error('CONFIG.CHAT_ID_PERSONAL не задан');
+    }
+
+    const { TEMPLATE_TUF_ID, TEMPLATE_INOTE_ID, OUTPUT_FOLDER_ID } = CONFIG.ONLINER_PRINT;
+    if (!TEMPLATE_TUF_ID || !TEMPLATE_INOTE_ID || !OUTPUT_FOLDER_ID) {
+      throw new Error('Не заполнены ONLINER_PRINT_TEMPLATE_TUF_ID / ONLINER_PRINT_TEMPLATE_INOTE_ID / ONLINER_PRINT_OUTPUT_FOLDER_ID');
+    }
+
+    const todayRows = Array.isArray(baseRows) ? baseRows : getTodayOrderRows();
+    if (!todayRows.length) {
+      throw new Error('Нет заказов на сегодня для формирования гарантийных талонов.');
+    }
+
+    const warrantyRows = buildPrintRowsForToday(todayRows);
+    const checksRows = todayRows.map(item => item.row);
+
+    const today = Utilities.formatDate(new Date(), 'GMT+03', 'dd.MM.yyyy');
+    const warrantyFileName = `Гарантийные талоны ${today}`;
+    const checksFileName = `${warrantyFileName} чеки`;
+
+    const templates = {
+      TUF: DocumentApp.openById(TEMPLATE_TUF_ID),
+      INOTE: DocumentApp.openById(TEMPLATE_INOTE_ID)
+    };
+
+    const { file: mergedFile, doc: mergedDoc } = copyAndProcessTemplate(
+      TEMPLATE_INOTE_ID,
+      OUTPUT_FOLDER_ID,
+      warrantyFileName
+    );
+
+    const body = mergedDoc.getBody();
+    body.clear();
+
+    const orderNumbers = [];
+
+    warrantyRows.forEach((row, index) => {
+      const source = String(row[ONLINER_PRINT_COLUMNS.SOURCE] || '').toLowerCase();
+      const templateBody = (source.includes('tuf') ? templates.TUF : templates.INOTE).getBody();
+      const startIndex = body.getNumChildren();
+
+      appendTemplateContent(body, templateBody);
+
+      const endIndex = body.getNumChildren() - 1;
+      const dateValue = row[ONLINER_PRINT_COLUMNS.DATE_DELIVERY];
+      const deliveryDate = dateValue instanceof Date
+        ? Utilities.formatDate(dateValue, 'GMT+03', 'dd.MM.yyyy')
+        : dateValue;
+
+      const acValue = parseInt(row[ONLINER_PRINT_COLUMNS.WARRANTY_BASE], 10);
+      const aiValue = parseInt(row[ONLINER_PRINT_COLUMNS.WARRANTY_FULL], 10);
+      const finalPrice = parsePrice(row[ONLINER_PRINT_COLUMNS.SALE_PRICE]);
+      const orderNumber = String(row[ONLINER_PRINT_COLUMNS.ORDER_NUMBER] || '').trim();
+
+      if (orderNumber) {
+        orderNumbers.push(orderNumber);
+      }
+
+      const replacements = {
+        '{Дата}': deliveryDate || '',
+        '{Модель}': row[ONLINER_PRINT_COLUMNS.MODEL] || '',
+        '{Цена продажи}': formatByrAmount(finalPrice, ' '),
+        '{Гарантия}': buildWarrantyText(acValue, aiValue),
+        '{Номер заказа}': orderNumber
+      };
+
+      for (let i = startIndex; i <= endIndex; i++) {
+        replaceInDocumentElement(body.getChild(i), replacements);
+      }
+
+      if (index < warrantyRows.length - 1) {
+        body.appendPageBreak();
+      }
+    });
+
+    mergedDoc.saveAndClose();
+    Object.values(templates).forEach(doc => doc.saveAndClose());
+
+    const modelsSummary = checksRows.map(mapRowToCheckSummary);
+    const checksSpreadsheet = createChecksSpreadsheetInFolder(
+      OUTPUT_FOLDER_ID,
+      checksFileName,
+      modelsSummary
+    );
+
+    if (sendOrderNumbers && orderNumbers.length) {
+      const ordersText = `📋 Номера заказов:\n${orderNumbers.map((num, idx) => `${idx + 1}. ${num}`).join('\n')}`;
+      sendMessage(ordersText, null, CONFIG.CHAT_ID_PERSONAL, CONFIG.SEND_MODE.FAST, null, { markdown: false });
+    }
+
+    sendMessage(
+      `Гарантийные талоны\n${mergedFile.getUrl()}`,
+      null,
+      CONFIG.CHAT_ID_PERSONAL,
+      CONFIG.SEND_MODE.FAST,
+      null,
+      { markdown: false }
+    );
+
+    sendMessage(
+      `Чеки\n${checksSpreadsheet.getUrl()}`,
+      null,
+      CONFIG.CHAT_ID_PERSONAL,
+      CONFIG.SEND_MODE.FAST,
+      null,
+      { markdown: false }
+    );
+
+    if (notifyUi && ui) {
+      ui.alert('✅ Готово', 'Ссылки на гарантийные талоны и чеки отправлены в личный Telegram.', ui.ButtonSet.OK);
+    }
+  } catch (error) {
+    if (notifyUi && ui) {
+      ui.alert('❌ Ошибка', error.message, ui.ButtonSet.OK);
+    }
+    throw error;
+  }
+}
+
 function normalizeSupplierName(name) {
   if (!name && name !== 0) return '';
   return String(name).trim().toLowerCase().replace(/\s+/g, '').replace(/[^0-9a-zа-яё]/gi, '');
@@ -1298,6 +1601,20 @@ function sendOrdersToTelegram() {
     }
 
     notifyTodayOrdersToPersonal(rows);
+
+    try {
+      createPrintDocumentsForBot(rows, { sendOrderNumbers: false, notifyUi: false });
+    } catch (printError) {
+      console.warn('⚠️ Не удалось сформировать гарантийные талоны/чеки:', printError.message);
+      sendMessage(
+        `⚠️ Не удалось сформировать гарантийные талоны/чеки: ${printError.message}`,
+        null,
+        CONFIG.CHAT_ID,
+        CONFIG.SEND_MODE.FAST,
+        null,
+        { markdown: false }
+      );
+    }
 
     // 2. ✅ Поставщики — ВСЕ за сегодня
     const supplierSums = collectSuppliersFromRows(rows);
